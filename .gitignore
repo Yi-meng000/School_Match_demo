@@ -1,0 +1,15 @@
+# ROS 2 编译产物目录
+build/
+install/
+log/
+
+# VS Code 本地索引与数据库缓存
+.vscode/
+*.db
+*.db-shm
+*.db-wal
+
+# 临时与备份文件
+*.swp
+*~
+.DS_Store

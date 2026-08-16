@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(ros2stm_pkg)
+project(robot_comm)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -8,16 +8,21 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(robot_interfaces REQUIRED)
 # uncomment the following section in order to fill in
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
 
-add_executable(${PROJECT_NAME} src/usb2uart_node.cpp)
+add_executable(usb2uart_node src/usb2uart_node.cpp)
+ament_target_dependencies(usb2uart_node rclcpp geometry_msgs robot_interfaces)
+add_executable(usb2topic_node src/usb2topic_node.cpp)
+ament_target_dependencies(usb2topic_node rclcpp robot_interfaces)
 
-ament_target_dependencies(${PROJECT_NAME} rclcpp)
 
 install(TARGETS
-  ${PROJECT_NAME}
+  usb2uart_node
+  usb2topic_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

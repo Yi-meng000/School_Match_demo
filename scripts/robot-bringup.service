@@ -1,0 +1,15 @@
+[Unit]
+Description=Robot bringup (robot_comm ROS 2 launch)
+
+[Service]
+Type=simple
+User=yimeng
+WorkingDirectory=/home/yimeng/rc/School_Match_ws
+ExecStart=/home/yimeng/rc/School_Match_ws/scripts/start_robot.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

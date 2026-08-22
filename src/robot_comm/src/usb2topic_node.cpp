@@ -1,5 +1,6 @@
 #include "rclcpp/rclcpp.hpp"
 #include "robot_interfaces/msg/chassis_cmd.hpp"
+#include "robot_interfaces/msg/controller_cmd.hpp"
 
 #include <fcntl.h>
 #include <termios.h>
@@ -15,12 +16,33 @@
 #include <memory>
 using namespace std::chrono_literals;
 
-constexpr size_t kFrameSize = 17; // 蓝牙帧长度
-
+constexpr size_t kFrameSize = 24; // 蓝牙帧长度
+// std::string wifi_connect = "AT+CWJAP=iQOO Neo9S Pro,134795Frt\r\n";
+        // std::string wifi_connect = "AT+CWJAP=iQOO 12,arcstar123\r\n";
+        // write(serial_fd_, wifi_connect.c_str(), wifi_connect.length());
 class BluetoothReceiveNode : public rclcpp::Node
 {
+public:
+    explicit BluetoothReceiveNode(const std::string & node_name): Node(node_name)
+    {
+        pub_cmd_controller_ = this->create_publisher<robot_interfaces::msg::ControllerCmd>("cmd_controller", 10);
+        initSerial("/dev/tty_bluetooth", 115200); 
+        read_timer_ = this->create_wall_timer(10ms,
+            std::bind(&BluetoothReceiveNode::TransTimerCallback, this));
+        RCLCPP_INFO(this->get_logger(), "Publisher for cmd_controller has been created.");
+    }
+
+    ~BluetoothReceiveNode() {
+        if (serial_fd_ >= 0) {
+            close(serial_fd_);
+            RCLCPP_INFO(this->get_logger(), "蓝牙接受串口已关闭");
+            serial_fd_ = -1;
+        }
+    }
+
+
 private:
-    rclcpp::Publisher<robot_interfaces::msg::ChassisCmd>::SharedPtr pub_cmd_chassis_; // 发布cmd_chassis的智能指针
+    rclcpp::Publisher<robot_interfaces::msg::ControllerCmd>::SharedPtr pub_cmd_controller_; // 发布cmd_controller的智能指针
     int serial_fd_{-1}; // 串口文件描述符 (-1 表示未打开)
     std::vector<uint8_t> rx_buf_; // 接收缓冲区
     rclcpp::TimerBase::SharedPtr read_timer_; // 定时器，用于定期读取串口数据
@@ -118,35 +140,20 @@ private:
                 rx_buf_.erase(rx_buf_.begin()); 
                 continue; 
             }
-            auto frame_msg = robot_interfaces::msg::ChassisCmd();
+            auto frame_msg = robot_interfaces::msg::ControllerCmd();
             frame_msg.enable = rx_buf_[1];
             frame_msg.protect = rx_buf_[2];
-            memcpy(&frame_msg.vx, &rx_buf_[3], sizeof(float));
-            memcpy(&frame_msg.vy, &rx_buf_[7], sizeof(float));
-            memcpy(&frame_msg.vw, &rx_buf_[11], sizeof(float));
-            pub_cmd_chassis_->publish(frame_msg);
+            frame_msg.mode = rx_buf_[3];
+            memcpy(&frame_msg.goal_x, &rx_buf_[4], sizeof(uint16_t));
+            memcpy(&frame_msg.goal_y, &rx_buf_[6], sizeof(uint16_t));
+            memcpy(&frame_msg.goal_yaw, &rx_buf_[8], sizeof(uint16_t));
+            memcpy(&frame_msg.vx, &rx_buf_[10], sizeof(float));
+            memcpy(&frame_msg.vy, &rx_buf_[14], sizeof(float));
+            memcpy(&frame_msg.vw, &rx_buf_[18], sizeof(float));
+            pub_cmd_controller_->publish(frame_msg);
             rx_buf_.erase(rx_buf_.begin(), rx_buf_.begin() + kFrameSize); 
         }
     }
-
-public:
-    explicit BluetoothReceiveNode(const std::string & node_name): Node(node_name)
-    {
-        pub_cmd_chassis_ = this->create_publisher<robot_interfaces::msg::ChassisCmd>("cmd_chassis", 10);
-        initSerial("/dev/tty_bluetooth", 115200); 
-        read_timer_ = this->create_wall_timer(10ms,
-            std::bind(&BluetoothReceiveNode::TransTimerCallback, this));
-        RCLCPP_INFO(this->get_logger(), "Publisher for cmd_chassis has been created.");
-    }
-
-    ~BluetoothReceiveNode() {
-        if (serial_fd_ >= 0) {
-            close(serial_fd_);
-            serial_fd_ = -1;
-        }
-    }
-
-
 };
 
 int main(int argc, char** argv)

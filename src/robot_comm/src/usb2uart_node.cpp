@@ -30,6 +30,24 @@ struct ChassisCmdFrame {
 
 class Usb2UartTransNode : public rclcpp::Node
 {
+public:
+    explicit Usb2UartTransNode(const std::string & node_name): Node(node_name)
+    {
+        initSerial("/dev/tty_stm32h7", 115200);
+
+        sub_cmd_chassis_ = this->create_subscription<robot_interfaces::msg::ChassisCmd>(
+            "cmd_chassis", 10, 
+            std::bind(&Usb2UartTransNode::CmdChassisCallback, this, std::placeholders::_1));
+    }
+
+    ~Usb2UartTransNode()
+    {
+        if (serial_fd_ >= 0) {
+            close(serial_fd_);
+            RCLCPP_INFO(this->get_logger(), "stm32发送串口已关闭");
+        }
+    }
+
 private:
     rclcpp::Subscription<robot_interfaces::msg::ChassisCmd>::SharedPtr sub_cmd_chassis_; // 订阅cmd_chassis的智能指针
     int serial_fd_{-1}; // 串口文件描述符 (-1 表示未打开)
@@ -114,24 +132,6 @@ private:
             RCLCPP_INFO(this->get_logger(), 
             "串口发送 cmd_chassis: enable=%d, protect=%d, vel_x=%.2f, vel_y=%.2f, vel_w=%.2f", 
             frame.enable, frame.protect, frame.vel_x, frame.vel_y, frame.vel_w);
-        }
-        
-    }
-public:
-    explicit Usb2UartTransNode(const std::string & node_name): Node(node_name)
-    {
-        initSerial("/dev/tty_stm32h7", 115200);
-
-        sub_cmd_chassis_ = this->create_subscription<robot_interfaces::msg::ChassisCmd>(
-            "cmd_chassis", 10, 
-            std::bind(&Usb2UartTransNode::CmdChassisCallback, this, std::placeholders::_1));
-    }
-
-    ~Usb2UartTransNode()
-    {
-        if (serial_fd_ >= 0) {
-            close(serial_fd_);
-            RCLCPP_INFO(this->get_logger(), "串口已关闭");
         }
     }
 

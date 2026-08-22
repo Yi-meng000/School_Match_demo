@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(robot_interfaces)
+project(robot_control)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -7,18 +7,20 @@ endif()
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(robot_interfaces REQUIRED)
 # uncomment the following section in order to fill in
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
 
-# 将消息接口定义文件转化为库或头文件
-rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/ChassisCmd.msg"
-  "msg/ControllerCmd.msg"
-  "msg/TracingInput.msg"
+add_executable(commmux_node src/commmux_node.cpp)
+ament_target_dependencies(commmux_node rclcpp geometry_msgs robot_interfaces)
+
+install(TARGETS
+  commmux_node
+  DESTINATION lib/${PROJECT_NAME}
 )
-ament_export_dependencies(rosidl_default_runtime)
 
 
 if(BUILD_TESTING)

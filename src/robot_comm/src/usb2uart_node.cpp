@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <string>
 
+#define MAX_SPEED 1.75 //m/s
+#define MAX_OMEGA 5.23598776   // rad/s(300度/s)
 
 #pragma pack(push, 1) // 把当前的对齐规则“压入栈中备份”，并将当前对齐规则强制改为“1字节对齐”
 
@@ -121,9 +123,9 @@ private:
         frame.header = 0xA5;
         frame.enable = msg->enable;
         frame.protect = msg->protect;
-        frame.vel_x = msg->vx;
-        frame.vel_y = msg->vy;
-        frame.vel_w = msg->vw;
+        frame.vel_x = msg->vx / MAX_SPEED * 128.0f;
+        frame.vel_y = msg->vy / MAX_SPEED * 128.0f;
+        frame.vel_w = msg->vw / MAX_OMEGA * 128.0f;
         frame.tail = 0x5A;
         ssize_t bytes_sent = write(serial_fd_, &frame, sizeof(frame));
         if(bytes_sent < 0) {

@@ -8,6 +8,7 @@ log/
 *.db
 *.db-shm
 *.db-wal
+.claude/
 
 # 临时与备份文件
 *.swp

@@ -4,8 +4,6 @@
 #include "robot_interfaces/msg/controller_cmd.hpp"
 #include "robot_interfaces/msg/tracing_input.hpp"
 
-
-
 class CommMuxNode : public rclcpp::Node
 {
 public:
@@ -34,9 +32,7 @@ private:
         auto tracing_input_msg = robot_interfaces::msg::TracingInput();
         auto chassis_cmd_msg = robot_interfaces::msg::ChassisCmd();
 
-        tracing_input_msg.goal_x = msg->goal_x / 1.f; // 转换为毫米
-        tracing_input_msg.goal_y = msg->goal_y / 1.f; // 转换为毫米
-        tracing_input_msg.goal_yaw = msg->goal_yaw / 10.f; // 转换为度数
+
         // todo 目前没有自动和手动的切换，加入锁点后应补充上仲裁
         chassis_cmd_msg.enable = msg->enable;
         chassis_cmd_msg.protect = msg->protect;

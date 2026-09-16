@@ -1,0 +1,7 @@
+float32 time_stamp        # 时间戳 (ms)
+float32 reference_x       # 参考点 X 坐标 (mm)
+float32 reference_y       # 参考点 Y 坐标 (mm)
+float32 reference_yaw     # 参考点 Yaw 角度 (0~360°)
+float32 reference_vx      # 参考点x向速度 (m/s)
+float32 reference_vy      # 参考点y向速度 (m/s)
+float32 reference_vw      # 参考点角速度 (rad/s)

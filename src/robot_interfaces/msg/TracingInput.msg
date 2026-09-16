@@ -1,3 +1,2 @@
-float32 goal_x       # 目标点 X 坐标 (mm)
-float32 goal_y       # 目标点 Y 坐标 (mm)
-float32 goal_yaw     # 目标点 Yaw 角度 (0~360°)
+std_msgs/Header header  # 消息头，包含时间戳和参考坐标系
+TrajectoryPoint[] trajectory_points  # 轨迹点数组

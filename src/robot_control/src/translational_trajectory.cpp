@@ -13,6 +13,7 @@ namespace
 
 constexpr double kEps = 1e-9;
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kSpeedFeasibilityTolerance = 1e-3;
 
 bool finite(double value)
 {
@@ -735,10 +736,26 @@ bool TrajectoryGenerator::activatePath(const PathGeometry& geometry, const Motio
   active_ = true;
   progress_ = projection.arc_length;
   profile_.clear();
+  exact_nominal_ = {};
+  reference_profile_.clear();
+  reference_exact_nominal_ = {};
+  reference_time_ = 0.0;
   diagnostics_ = {};
   diagnostics_.status = TrajectoryStatus::Ready;
   diagnostics_.progress = progress_;
   diagnostics_.remaining_length = path_.length() - progress_;
+  if (!rebuildProfile(current_state, true))
+  {
+    active_ = false;
+    if (error != nullptr)
+    {
+      *error = "Cannot construct the initial trajectory profile";
+    }
+    diagnostics_.status = TrajectoryStatus::PathRejected;
+    return false;
+  }
+  reference_profile_ = profile_;
+  reference_exact_nominal_ = exact_nominal_;
   return true;
 }
 
@@ -748,10 +765,13 @@ void TrajectoryGenerator::clearPath()
   progress_ = 0.0;
   profile_.clear();
   exact_nominal_ = {};
+  reference_profile_.clear();
+  reference_exact_nominal_ = {};
+  reference_time_ = 0.0;
   diagnostics_ = {};
 }
 
-bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state)
+bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state, bool apply_nominal_shape)
 {
   profile_.clear();
   exact_nominal_ = {};
@@ -761,7 +781,8 @@ bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state)
     diagnostics_.status = TrajectoryStatus::NoActivePath;
     return false;
   }
-  if (options_.profile_spacing <= kEps || options_.minimum_speed_for_time <= 0.0)
+  if (options_.profile_spacing <= kEps || options_.minimum_speed_for_time <= 0.0 ||
+      options_.max_reference_lead <= 0.0)
   {
     diagnostics_.status = TrajectoryStatus::NoActivePath;
     return false;
@@ -829,7 +850,7 @@ bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state)
     {
       caps[i] = std::min(caps[i], std::sqrt(limits_.max_lateral_accel / curvature));
     }
-    if (nominal.valid)
+    if (apply_nominal_shape && nominal.valid)
     {
       caps[i] = std::min(caps[i], nominal.speedAt(arc_lengths[i] - progress_));
     }
@@ -855,14 +876,16 @@ bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state)
   const std::vector<double> normal_back =
       backwardEnvelope(caps, arc_lengths, limits_.terminal_speed, limits_.normal_decel);
   const bool normal_infeasible =
-      diagnostics_.normal_stop_distance > remaining + 1e-6 || initial_speed > normal_back.front() + 1e-6;
+      diagnostics_.normal_stop_distance > remaining + 1e-6 ||
+      initial_speed > normal_back.front() + kSpeedFeasibilityTolerance;
   const double decel_used = normal_infeasible ? limits_.emergency_decel : limits_.normal_decel;
   const std::vector<double> back =
       normal_infeasible ? backwardEnvelope(caps, arc_lengths, limits_.terminal_speed, limits_.emergency_decel) :
                           normal_back;
 
-  const bool emergency_infeasible = normal_infeasible && (diagnostics_.emergency_stop_distance > remaining + 1e-6 ||
-                                                          initial_speed > back.front() + 1e-6);
+  const bool emergency_infeasible = normal_infeasible &&
+      (diagnostics_.emergency_stop_distance > remaining + 1e-6 ||
+       initial_speed > back.front() + kSpeedFeasibilityTolerance);
   diagnostics_.status = emergency_infeasible ?
                             TrajectoryStatus::EmergencyInfeasible :
                             (normal_infeasible ? TrajectoryStatus::EmergencyBraking : TrajectoryStatus::Ready);
@@ -882,7 +905,7 @@ bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state)
         std::sqrt(std::max(0.0, speeds[i - 1] * speeds[i - 1] + 2.0 * limits_.max_accel * ds));
     const double braking_floor = std::sqrt(std::max(0.0, speeds[i - 1] * speeds[i - 1] - 2.0 * decel_used * ds));
     speeds[i] = std::min(back[i], acceleration_reachable);
-    if (speeds[i] + 1e-6 < braking_floor)
+    if (speeds[i] + kSpeedFeasibilityTolerance < braking_floor)
     {
       // Even emergency braking cannot reach the requested curve/end speed.
       // Keep the physically reachable speed and make the unsafe condition explicit.
@@ -896,7 +919,7 @@ bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state)
   // If no curve or acceleration envelope changed the nominal profile, retain
   // its analytic time-domain sine form instead of approximating it as piecewise
   // constant acceleration.  Constrained portions use the table below.
-  if (diagnostics_.status == TrajectoryStatus::Ready && nominal.valid)
+  if (apply_nominal_shape && diagnostics_.status == TrajectoryStatus::Ready && nominal.valid)
   {
     bool equals_nominal = true;
     for (std::size_t i = 0; i < node_count; ++i)
@@ -940,18 +963,20 @@ bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state)
   return true;
 }
 
-ReferencePoint TrajectoryGenerator::sampleProfile(double time_from_now, const HeadingProvider& heading_provider) const
+ReferencePoint TrajectoryGenerator::sampleProfile(const std::vector<ProfileNode>& profile,
+                                                  const ExactSinusoid& exact_nominal,
+                                                  double profile_time) const
 {
   ReferencePoint result;
-  if (profile_.empty())
+  if (profile.empty())
   {
     return result;
   }
 
-  double s = profile_.front().arc_length;
-  double speed = profile_.front().speed;
-  double tangential_acceleration = profile_.front().tangential_acceleration;
-  if (exact_nominal_.active)
+  double s = profile.front().arc_length;
+  double speed = profile.front().speed;
+  double tangential_acceleration = profile.front().tangential_acceleration;
+  if (exact_nominal.active)
   {
     const auto phase = [](double duration, double from, double to, double time, double* distance, double* value,
                           double* acceleration) {
@@ -972,68 +997,68 @@ ReferencePoint TrajectoryGenerator::sampleProfile(double time_from_now, const He
     };
 
     const double accel_duration =
-        exact_nominal_.accel_distance > kEps && exact_nominal_.start_speed + exact_nominal_.peak_speed > kEps ?
-            2.0 * exact_nominal_.accel_distance / (exact_nominal_.start_speed + exact_nominal_.peak_speed) :
+        exact_nominal.accel_distance > kEps && exact_nominal.start_speed + exact_nominal.peak_speed > kEps ?
+            2.0 * exact_nominal.accel_distance / (exact_nominal.start_speed + exact_nominal.peak_speed) :
             0.0;
     const double cruise_duration =
-        exact_nominal_.peak_speed > kEps ? exact_nominal_.cruise_distance / exact_nominal_.peak_speed : 0.0;
+        exact_nominal.peak_speed > kEps ? exact_nominal.cruise_distance / exact_nominal.peak_speed : 0.0;
     const double decel_duration =
-        exact_nominal_.decel_distance > kEps && exact_nominal_.peak_speed + exact_nominal_.end_speed > kEps ?
-            2.0 * exact_nominal_.decel_distance / (exact_nominal_.peak_speed + exact_nominal_.end_speed) :
+        exact_nominal.decel_distance > kEps && exact_nominal.peak_speed + exact_nominal.end_speed > kEps ?
+            2.0 * exact_nominal.decel_distance / (exact_nominal.peak_speed + exact_nominal.end_speed) :
             0.0;
     const double total_duration =
-        exact_nominal_.direct_ramp ?
-            2.0 * exact_nominal_.length / std::max(kEps, exact_nominal_.start_speed + exact_nominal_.end_speed) :
+        exact_nominal.direct_ramp ?
+            2.0 * exact_nominal.length / std::max(kEps, exact_nominal.start_speed + exact_nominal.end_speed) :
             accel_duration + cruise_duration + decel_duration;
 
     double relative_s = 0.0;
-    if (time_from_now >= total_duration)
+    if (profile_time >= total_duration)
     {
-      relative_s = exact_nominal_.length;
-      speed = exact_nominal_.end_speed;
+      relative_s = exact_nominal.length;
+      speed = exact_nominal.end_speed;
       tangential_acceleration = 0.0;
     }
-    else if (exact_nominal_.direct_ramp)
+    else if (exact_nominal.direct_ramp)
     {
-      phase(total_duration, exact_nominal_.start_speed, exact_nominal_.end_speed, time_from_now, &relative_s, &speed,
+      phase(total_duration, exact_nominal.start_speed, exact_nominal.end_speed, profile_time, &relative_s, &speed,
             &tangential_acceleration);
     }
-    else if (time_from_now <= accel_duration)
+    else if (profile_time <= accel_duration)
     {
-      phase(accel_duration, exact_nominal_.start_speed, exact_nominal_.peak_speed, time_from_now, &relative_s, &speed,
+      phase(accel_duration, exact_nominal.start_speed, exact_nominal.peak_speed, profile_time, &relative_s, &speed,
             &tangential_acceleration);
     }
-    else if (time_from_now <= accel_duration + cruise_duration)
+    else if (profile_time <= accel_duration + cruise_duration)
     {
-      relative_s = exact_nominal_.accel_distance + exact_nominal_.peak_speed * (time_from_now - accel_duration);
-      speed = exact_nominal_.peak_speed;
+      relative_s = exact_nominal.accel_distance + exact_nominal.peak_speed * (profile_time - accel_duration);
+      speed = exact_nominal.peak_speed;
       tangential_acceleration = 0.0;
     }
     else
     {
       double decel_s = 0.0;
-      phase(decel_duration, exact_nominal_.peak_speed, exact_nominal_.end_speed,
-            time_from_now - accel_duration - cruise_duration, &decel_s, &speed, &tangential_acceleration);
-      relative_s = exact_nominal_.accel_distance + exact_nominal_.cruise_distance + decel_s;
+      phase(decel_duration, exact_nominal.peak_speed, exact_nominal.end_speed,
+            profile_time - accel_duration - cruise_duration, &decel_s, &speed, &tangential_acceleration);
+      relative_s = exact_nominal.accel_distance + exact_nominal.cruise_distance + decel_s;
     }
-    s = exact_nominal_.start_arc_length + relative_s;
+    s = exact_nominal.start_arc_length + relative_s;
   }
-  else if (time_from_now >= profile_.back().time)
+  else if (profile_time >= profile.back().time)
   {
-    s = profile_.back().arc_length;
-    speed = profile_.back().speed;
+    s = profile.back().arc_length;
+    speed = profile.back().speed;
     tangential_acceleration = 0.0;
   }
-  else if (time_from_now > 0.0)
+  else if (profile_time > 0.0)
   {
-    const auto upper = std::upper_bound(profile_.begin(), profile_.end(), time_from_now,
+    const auto upper = std::upper_bound(profile.begin(), profile.end(), profile_time,
                                         [](double time, const ProfileNode& node) { return time < node.time; });
-    const std::size_t next = static_cast<std::size_t>(upper - profile_.begin());
+    const std::size_t next = static_cast<std::size_t>(upper - profile.begin());
     const std::size_t previous = next - 1;
-    const ProfileNode& a = profile_[previous];
-    const ProfileNode& b = profile_[next];
+    const ProfileNode& a = profile[previous];
+    const ProfileNode& b = profile[next];
     const double duration = b.time - a.time;
-    const double local_time = time_from_now - a.time;
+    const double local_time = profile_time - a.time;
     tangential_acceleration = duration > kEps ? (b.speed - a.speed) / duration : 0.0;
     speed = a.speed + tangential_acceleration * local_time;
     s = a.arc_length + a.speed * local_time + 0.5 * tangential_acceleration * local_time * local_time;
@@ -1042,7 +1067,7 @@ ReferencePoint TrajectoryGenerator::sampleProfile(double time_from_now, const He
 
   const PathSample path_sample = path_.sample(s);
   const Vector2 normal{ -path_sample.tangent.y, path_sample.tangent.x };
-  result.time_from_now = std::max(0.0, time_from_now);
+  result.time_from_now = std::max(0.0, profile_time);
   result.arc_length = s;
   result.position = path_sample.position;
   result.speed = speed;
@@ -1051,11 +1076,97 @@ ReferencePoint TrajectoryGenerator::sampleProfile(double time_from_now, const He
   result.velocity = scale(path_sample.tangent, speed);
   result.acceleration =
       add(scale(path_sample.tangent, tangential_acceleration), scale(normal, path_sample.curvature * speed * speed));
-  if (heading_provider)
-  {
-    result.heading = heading_provider(result.time_from_now, result.arc_length);
-  }
   return result;
+}
+
+double TrajectoryGenerator::profileSpeedAtArcLength(const std::vector<ProfileNode>& profile,
+                                                    double arc_length) const
+{
+  if (profile.empty())
+  {
+    return 0.0;
+  }
+  if (arc_length <= profile.front().arc_length)
+  {
+    return profile.front().speed;
+  }
+  if (arc_length >= profile.back().arc_length)
+  {
+    return profile.back().speed;
+  }
+
+  const auto upper = std::upper_bound(profile.begin(), profile.end(), arc_length,
+                                      [](double s, const ProfileNode& node) { return s < node.arc_length; });
+  const ProfileNode& b = *upper;
+  const ProfileNode& a = *(upper - 1);
+  const double ds = b.arc_length - a.arc_length;
+  const double ratio = ds > kEps ? clamp((arc_length - a.arc_length) / ds, 0.0, 1.0) : 0.0;
+  // Constant tangential acceleration is linear in v^2 over distance. Using
+  // energy interpolation avoids an artificial near-zero cap in the first
+  // spatial cell when the vehicle starts from rest.
+  const double speed_squared = a.speed * a.speed + ratio * (b.speed * b.speed - a.speed * a.speed);
+  return std::sqrt(std::max(0.0, speed_squared));
+}
+
+double TrajectoryGenerator::profileDuration(const std::vector<ProfileNode>& profile,
+                                            const ExactSinusoid& exact_nominal) const
+{
+  if (profile.empty())
+  {
+    return 0.0;
+  }
+  if (!exact_nominal.active)
+  {
+    return profile.back().time;
+  }
+  if (exact_nominal.direct_ramp)
+  {
+    return 2.0 * exact_nominal.length /
+           std::max(kEps, exact_nominal.start_speed + exact_nominal.end_speed);
+  }
+
+  const double accel_duration =
+      exact_nominal.accel_distance > kEps && exact_nominal.start_speed + exact_nominal.peak_speed > kEps ?
+          2.0 * exact_nominal.accel_distance / (exact_nominal.start_speed + exact_nominal.peak_speed) :
+          0.0;
+  const double cruise_duration =
+      exact_nominal.peak_speed > kEps ? exact_nominal.cruise_distance / exact_nominal.peak_speed : 0.0;
+  const double decel_duration =
+      exact_nominal.decel_distance > kEps && exact_nominal.peak_speed + exact_nominal.end_speed > kEps ?
+          2.0 * exact_nominal.decel_distance / (exact_nominal.peak_speed + exact_nominal.end_speed) :
+          0.0;
+  return accel_duration + cruise_duration + decel_duration;
+}
+
+double TrajectoryGenerator::profileTimeAtArcLength(const std::vector<ProfileNode>& profile,
+                                                   const ExactSinusoid& exact_nominal,
+                                                   double arc_length) const
+{
+  if (profile.empty() || arc_length <= profile.front().arc_length)
+  {
+    return 0.0;
+  }
+  const double duration = profileDuration(profile, exact_nominal);
+  if (arc_length >= profile.back().arc_length || duration <= kEps)
+  {
+    return duration;
+  }
+
+  double lo = 0.0;
+  double hi = duration;
+  for (int iteration = 0; iteration < 60; ++iteration)
+  {
+    const double mid = 0.5 * (lo + hi);
+    if (sampleProfile(profile, exact_nominal, mid).arc_length < arc_length)
+    {
+      lo = mid;
+    }
+    else
+    {
+      hi = mid;
+    }
+  }
+  return 0.5 * (lo + hi);
 }
 
 TrajectoryStatus TrajectoryGenerator::makeHorizon(const MotionState2D& current_state, double dt, std::size_t steps,
@@ -1070,15 +1181,85 @@ TrajectoryStatus TrajectoryGenerator::makeHorizon(const MotionState2D& current_s
   {
     return active_ ? diagnostics_.status : TrajectoryStatus::NoActivePath;
   }
-  if (!rebuildProfile(current_state))
+  // Rebuild only the safety envelope from the latest measured state. The
+  // activation-time nominal profile below is deliberately kept intact so its
+  // sine phase cannot restart at every control tick.
+  if (!rebuildProfile(current_state, false))
   {
     return diagnostics_.status;
   }
+  if (reference_profile_.empty())
+  {
+    diagnostics_.status = TrajectoryStatus::NoActivePath;
+    return diagnostics_.status;
+  }
+
+  const double reference_duration = profileDuration(reference_profile_, reference_exact_nominal_);
+  const double reference_end = reference_profile_.back().arc_length;
+  const double synchronized_time = profileTimeAtArcLength(
+      reference_profile_, reference_exact_nominal_, std::min(progress_, reference_end));
+  const double allowed_reference_arc =
+      std::min(reference_end, progress_ + options_.max_reference_lead);
+  const double allowed_reference_time = profileTimeAtArcLength(
+      reference_profile_, reference_exact_nominal_, allowed_reference_arc);
+  const double proposed_reference_time = std::max(reference_time_ + dt, synchronized_time);
+  reference_time_ = std::min(reference_duration,
+                             std::max(reference_time_, std::min(proposed_reference_time, allowed_reference_time)));
 
   out->reserve(steps);
+  const PathSample measured_path_sample = path_.sample(progress_);
+  double previous_speed = std::max(0.0, dot(current_state.velocity, measured_path_sample.tangent));
+  double reference_arc = progress_;
+  const double deceleration = diagnostics_.status == TrajectoryStatus::Ready ?
+                                  limits_.normal_decel : limits_.emergency_decel;
   for (std::size_t i = 0; i < steps; ++i)
   {
-    out->push_back(sampleProfile(static_cast<double>(i + 1) * dt, heading_provider));
+    const double time_from_now = static_cast<double>(i + 1) * dt;
+    const double profile_time = std::min(reference_duration, reference_time_ + static_cast<double>(i) * dt);
+    const ReferencePoint nominal = sampleProfile(
+        reference_profile_, reference_exact_nominal_, profile_time);
+
+    const double lower_speed = std::max(0.0, previous_speed - deceleration * dt);
+    const double upper_speed = previous_speed + limits_.max_accel * dt;
+    double speed = clamp(nominal.speed, lower_speed, upper_speed);
+
+    // Couple the persistent nominal phase to the spatial safety envelope. Two
+    // passes are sufficient because the candidate distance changes only one
+    // control step and profile_spacing is small.
+    double next_arc = reference_arc;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+      next_arc = std::min(path_.length(), reference_arc + 0.5 * (previous_speed + speed) * dt);
+      // Leave a small numerical margin so projection/tangent interpolation on
+      // the next control tick cannot place the measured speed microscopically
+      // above the backward braking envelope and falsely report infeasibility.
+      const double spatial_cap =
+          std::max(0.0, profileSpeedAtArcLength(profile_, next_arc) - 1e-4);
+      speed = std::max(lower_speed, std::min(speed, spatial_cap));
+    }
+    next_arc = std::min(path_.length(), reference_arc + 0.5 * (previous_speed + speed) * dt);
+
+    const PathSample path_sample = path_.sample(next_arc);
+    const Vector2 normal{ -path_sample.tangent.y, path_sample.tangent.x };
+    const double tangential_acceleration = (speed - previous_speed) / dt;
+    ReferencePoint point;
+    point.time_from_now = time_from_now;
+    point.arc_length = next_arc;
+    point.position = path_sample.position;
+    point.speed = speed;
+    point.tangential_acceleration = tangential_acceleration;
+    point.curvature = path_sample.curvature;
+    point.velocity = scale(path_sample.tangent, speed);
+    point.acceleration = add(
+        scale(path_sample.tangent, tangential_acceleration),
+        scale(normal, path_sample.curvature * speed * speed));
+    if (heading_provider)
+    {
+      point.heading = heading_provider(time_from_now, point.arc_length);
+    }
+    out->push_back(point);
+    reference_arc = next_arc;
+    previous_speed = speed;
   }
   return diagnostics_.status;
 }

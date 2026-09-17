@@ -207,6 +207,7 @@ controlTick()（L345--508）每个周期按下列优先级检查。上面的条�
 | local_projection_backtrack / lookahead | 1.0 / 3.0 m | 每周期投影优先搜索的进度窗口。 |
 | profile_spacing | 0.02 m | 速度包络弧长离散间隔。 |
 | minimum_speed_for_time | 1e-4 m/s | 从速度积分时间时的除零保护。 |
+| max_reference_lead | 0.10 m | 名义速度相位相对实测进度的最大弧长超前量。 |
 | q_diag_ | 120,120,90,2,0.5,2 | MPC 六维状态误差权重。 |
 | r_diag_ | 1.5,1.5,0.8 | MPC 三个速度增量的惩罚。 |
 | normal_mpc_accel_ | 2,3,4 | 正常状态下 vx、vy、vw 速度增量限值。 |
@@ -215,6 +216,7 @@ controlTick()（L345--508）每个周期按下列优先级检查。上面的条�
 | goal_position_tolerance_ / goal_speed_tolerance_ | 0.05 m / 0.05 m/s | GOAL_REACHED 的双条件阈值。 |
 | odom_timeout_ | 0.30 s | 最后里程计超过此时长便停车。 |
 | plan_timeout_ | 0 s | 0 表示不要求规划器周期保活；临时 nav_msgs/Path 接口应保持 0，等 path_id 接口恢复后才适合正数保活。 |
+| odom_yaw_offset_ | -1.57079632679 rad | 临时补偿雷达里程计相对实际车头的 +90 度固定朝向偏差；雷达端修正后设为 0。 |
 | *_topic_ | 见源码 L150--154 | 允许 launch 文件改话题名。 |
 | path_frame_ / odom_frame_ / base_frame_ | map / odom / base_link_hf | 严格检查输入坐标系标识。 |
 
@@ -289,7 +291,7 @@ validOdomFrames 同时检查两项：
 | --- | --- | --- |
 | L225--235 | frame 不合法：置 have_odom_=false，记录文本，清空激活轨迹并立即发零。 | 不在坐标语义不明时控制车辆。 |
 | L238--246 | 记录当前时间；把 pose 写入 x/y/yaw，把 twist 原样写入 MPC 的 vx/vy/vw。 | MPC 期待当前速度在底盘系。 |
-| L242--243 | quaternion 经 yawFromQuaternion 取平面偏航角。 | 轨迹库和旋转辅助函数需要标量 yaw。 |
+| L242--243 | quaternion 经 yawFromQuaternion 取原始平面偏航角，再加 odom_yaw_offset 并归一化。 | 当前默认减 90 度，使车头沿世界 +x 时校正 yaw 接近 0；所有后续旋转必须共用此校正值。 |
 | L248--250 | 位置直接复用；机体系线速度用当前 yaw 旋转到世界系。 | 轨迹库依靠速度在路径切线上的投影来确定初速度。 |
 | L251 | 置 have_odom_=true。 | 允许 controlTick 进入下一阶段。 |
 | L253--260 | 若已开、已有路径、还未激活、且没有终点/急停/拒绝锁存，尝试激活。 | 支持开关和路径均早到、里程计最后到的顺序。 |
@@ -421,6 +423,7 @@ GeneratorOptions 控制“每个控制周期怎么从当前状态重算”：
 | local_projection_lookahead | 已经有 progress_ 后，优先向前查找的距离。 |
 | profile_spacing | 速度包络的基础弧长网格；还会额外插入所有几何曲率结点。 |
 | minimum_speed_for_time | profile 的时间积分下限，防止速度和为零时除零。 |
+| max_reference_lead | 名义速度相位最多允许领先实测投影的弧长；默认 0.10 m，达到后暂停相位推进。 |
 
 ### 5.3 路径查询结果（L78--90）
 
@@ -497,7 +500,7 @@ ReferencePoint 是每个 MPC 未来时刻的一点：
 
 ### 5.6 TrajectoryGenerator 类、嵌套结构和成员（L170--240）
 
-TrajectoryGenerator 是“已接受的一条 PathGeometry 加当前测量状态”到“未来时间窗口”的状态机。它并不保存 ROS 消息，也不保存上一次 MPC 命令；每次 makeHorizon 都以最新实测状态重建速度剖面。
+TrajectoryGenerator 是“已接受的一条 PathGeometry 加当前测量状态”到“未来时间窗口”的状态机。它并不保存 ROS 消息，也不保存上一次 MPC 命令。路径激活时保存名义速度剖面和相位；每次 makeHorizon 只从最新实测状态重建安全包络。
 
 公开函数的职责：
 
@@ -506,12 +509,12 @@ TrajectoryGenerator 是“已接受的一条 PathGeometry 加当前测量状态�
 | 构造函数 | MotionLimits、GeneratorOptions | 复制配置。 | 不验证；调用方应先 setLimits 或在节点构造时检查。 |
 | setLimits | 新 MotionLimits | 验证成功后替换 limits_。 | false 加 error 表示不接受。 |
 | limits | 无 | 不改变。 | const 引用，仅供查看。 |
-| activatePath | 已建好的 PathGeometry、当前世界状态 | 复制路径，投影并初始化 progress_，清空旧 profile。 | false 表示路径/状态/接入距离无效。 |
-| clearPath | 无 | 清 active_、进度、离散剖面、精确正弦形状和诊断。 | 无返回。 |
+| activatePath | 已建好的 PathGeometry、当前世界状态 | 复制路径，投影并初始化 progress_，建立并保存新的名义 profile，相位置零。 | false 表示路径/状态/接入距离无效。 |
+| clearPath | 无 | 清 active_、进度、安全/名义剖面、精确正弦形状、相位和诊断。 | 无返回。 |
 | hasActivePath | 无 | 不改变。 | active_ 的值。 |
 | path | 无 | 不改变。 | 当前路径的 const 引用。 |
 | diagnostics | 无 | 不改变。 | 最近一次诊断的 const 引用。 |
-| makeHorizon | 最新状态、dt、步数、输出 vector、可选 yaw 函数 | 每次调用都会重建 profile_ 并可能推进 progress_。 | 返回库状态，out 得到最多 steps 个未来 ReferencePoint。 |
+| makeHorizon | 最新状态、dt、步数、输出 vector、可选 yaw 函数 | 重建安全 profile_、推进受超前量限制的名义相位，并推进 progress_。 | 返回库状态，out 得到最多 steps 个未来 ReferencePoint。 |
 
 私有 ProfileNode 是受约束速度包络的离散节点：
 
@@ -543,8 +546,9 @@ TrajectoryGenerator 是“已接受的一条 PathGeometry 加当前测量状态�
 | active_ | path_ 是否已被安全激活。 |
 | progress_ | 单调不减的路径进度；避免自交路径或定位噪声导致回跳。 |
 | diagnostics_ | 最近 activate 或 rebuild 的状态与制动指标。 |
-| profile_ | 有约束时使用的 time--s--v 离散表。 |
-| exact_nominal_ | 无约束时使用的解析正弦三段式缓存。 |
+| profile_ / exact_nominal_ | 每周期从实测状态重建的安全 time--s--v 表及其临时解析形式。 |
+| reference_profile_ / reference_exact_nominal_ | 激活路径时保存的完整名义速度剖面；不会在普通控制周期中重置。 |
+| reference_time_ | 跨 makeHorizon 调用持续推进的名义速度相位。 |
 
 ## 6. translational_trajectory.cpp：从基础数学到几何路径
 
@@ -789,7 +793,7 @@ project(position,hint,backtrack,lookahead) 是 public 策略：
 
 0.5 m 是当前库内固定的“局部投影不可信”阈值，和 GeneratorOptions::max_activation_offset 是不同概念：前者决定搜索范围是否回退，后者决定一条新路径是否可接入。
 
-## 9. TrajectoryGenerator：激活、每周期重建与安全状态
+## 9. TrajectoryGenerator：持续名义相位、实时安全包络与状态
 
 ### 9.1 构造、setLimits、activatePath、clearPath（L656--717）
 
@@ -812,8 +816,8 @@ activatePath（L672--708）定义“缓存一条路径”与“安全接入一�
 | L699 | 复制 geometry 到 path_。之后规划器重用/释放原候选对象不会影响生成器。 |
 | L700 | active_=true，makeHorizon 才会工作。 |
 | L701 | progress_ 从当前投影弧长开始，而非新路径第一个点。 |
-| L702 | 清除旧 profile，避免换路径后使用旧时间表。 |
-| L703--706 | 重置诊断，标 Ready，写初始进度和剩余距离。还没有计算停车距离，下一次 rebuildProfile 才会算。 |
+| L702 附近 | 清除旧安全/名义 profile 和旧相位，避免换路径后继承上一个任务。 |
+| 后续构建 | 立即按激活时的实测状态建立完整名义剖面，保存到 reference_profile_，并把 reference_time_ 置零。 |
 
 clearPath（L710--717）是“回到没有任务”的强复位：
 
@@ -821,17 +825,18 @@ clearPath（L710--717）是“回到没有任务”的强复位：
 - progress_=0 防止下条路径继承旧进度；
 - profile_ 清空；
 - exact_nominal_ 置默认值，关闭解析正弦模式；
+- reference_profile_、reference_exact_nominal_ 和 reference_time_ 一并复位；
 - diagnostics_ 置默认，status 也回到 NoActivePath。
 
-### 9.2 rebuildProfile 的入口和当前状态锚定（L719--759）
+### 9.2 rebuildProfile 的入口和实时安全状态锚定
 
-rebuildProfile 不断接收最新实测状态。它不是从上周期 profile_ 的末点积分，而是每个 control tick 按当前速度和当前位置重做“从现在开始”的速度规划，这能把实际跟踪误差、外扰和重规划纳入参考。
+rebuildProfile 不断接收最新实测状态。激活时传入 `apply_nominal_shape=true`，构建并保存完整正弦名义剖面；普通控制周期传入 false，只建立巡航、曲率、加速可达性和制动包络，不再生成一个新的正弦起步阶段。这使安全判断继续闭环使用实测状态，同时避免速度相位每拍回零。
 
 | 行 | 每句话的含义 |
 | --- | --- |
-| L721--722 | 清旧离散表和解析正弦缓存。本轮从零开始生成。 |
+| 函数入口 | 清旧的临时安全表和临时解析缓存；保存的 reference_profile_ 不受影响。 |
 | L723--728 | active_、路径、位置、速度任一不合法，诊断标 NoActivePath 并失败。 |
-| L729--732 | profile_spacing 和最小时间速度错误也不能生成。当前实现把它归为 NoActivePath。 |
+| 配置检查 | profile_spacing、最小时间速度或 max_reference_lead 非法时不能生成。 |
 | L734--737 | 用旧 progress_ 作为 hint，只在有限回看/前看范围投影当前车辆位置。 |
 | L738 | progress_=max(旧进度, 新投影)。即使定位噪声把投影拉回去，也不会倒退路径。 |
 | L739 | 剩余长度夹到非负。 |
@@ -1001,16 +1006,19 @@ L993 再把 s 夹到此段两端，处理浮点误差。
 
 库虽算出了 acceleration，但当前 tracing_node 只使用位置、速度和 heading。加速度留给状态诊断和未来的 MPC 前馈扩展。
 
-### 9.7 makeHorizon：轨迹库唯一的周期入口（L1014--1036）
+### 9.7 makeHorizon：持续相位和重新锚定的周期入口
 
-makeHorizon 的调用语义很短，但它串起前面所有步骤：
+makeHorizon 依次完成：
 
-1. L1021--1023：只要 out 非空，先 clear，确保失败时调用方不会误用上次窗口。
-2. L1024--1026：没有 active path、out 空、dt 非有限/不正或 steps=0 时不生成。若只是路径未激活返回 NoActivePath；路径还 active 时保留上次 diagnostics_.status。
-3. L1027--1029：按最新状态 rebuildProfile；失败直接返回该诊断。
-4. L1031：预留 steps，避免逐点扩容。
-5. L1032--1034：第 i 个点查询 (i+1)*dt。第一个点刻意是未来 dt 而不是当前 0，正符合离散 MPC 的第一个预测状态。
-6. L1035：返回本轮状态；Ready/EmergencyBraking/EmergencyInfeasible 由调用方决定后续策略。
+1. 清空输出并检查 active、dt、steps 和指针；
+2. 按最新实测投影和切向速度重建安全包络，但不把名义正弦相位置零；
+3. 将 reference_time_ 推进一个 dt；若名义弧长已比实测 progress_ 超前 max_reference_lead，则暂停推进；若车辆跑在名义相位前方，则将相位同步到实测进度；
+4. 每个未来点从当前实测 progress_ 重新积分位置，而不是沿上周期累计的位置参考继续前跑；
+5. 速度先读取持续名义相位，再同时受单步加减速可达区间和当前空间安全包络限制；
+6. 输出时间仍是 dt、2dt、...，外部 heading_provider 看到的是相对当前周期的时间；
+7. 返回 Ready、EmergencyBraking 或 EmergencyInfeasible，由调用方执行正常跟踪或安全处置。
+
+这种拆分专门避免两种相反故障：每拍重启正弦会让静止车辆永远只收到极小首速度；直接让整条位置参考按绝对时间前跑又会形成永久位置误差。当前实现只让速度相位持续，位置每拍重新锚定到实测投影。
 
 ## 10. 把一次 20 Hz 周期连成可执行心智模型
 
@@ -1026,12 +1034,13 @@ makeHorizon 的调用语义很短，但它串起前面所有步骤：
     平动库：
       1. 将当前位置投影到 path_，且 progress 不允许倒退；
       2. 取 v0 = dot(v_world, path_tangent)；
-      3. 在当前 s 到终点铺速度网格；
-      4. 对每个网格叠加巡航、正弦名义、曲率上限；
-      5. 从终点向前传播制动能力；
-      6. 从当前速度向前传播加速/制动可达性；
-      7. 积分成 t--s--v 表；
-      8. 取 t=0.05,0.10,...,1.00 的 x/y/vx/vy/ax/ay。
+      3. 从激活时保存的名义曲线继续推进 reference_time；
+      4. reference_time 的名义弧长最多领先实测 progress 0.10 m；
+      5. 在当前 s 到终点重建不含“新正弦起步”的安全速度网格；
+      6. 从终点向前传播曲率与制动能力，再从实测速度向前传播可达性；
+      7. 从实测 progress 重新积分未来 20 点的位置；
+      8. 每点速度取持续名义相位、单步加减速能力和空间安全包络共同允许的值；
+      9. 输出 t=0.05,0.10,...,1.00 的 x/y/vx/vy/ax/ay。
 
     tracing_node：
       对每一点，以 locked_yaw 把 v_world 转到 MPC 所用参考车体系；
@@ -1043,7 +1052,7 @@ makeHorizon 的调用语义很短，但它串起前面所有步骤：
       基于实测车体系 vx/vy/vw 与参考窗口求下一个小速度增量；
       tracing_node 发布求得的底盘系 vx/vy/vw。
 
-这里“重新生成速度包络”不等于“把定位位置硬贴到参考点”。MPC 仍用实际状态和第一未来参考点的误差求控制；轨迹库只重新用实测状态决定速度剖面的起点和接下来必须多早制动。
+这里保存的是名义速度相位，不是累计位置参考。MPC 仍用实际状态和第一未来参考点的误差求控制；第一参考位置每周期只从实测投影向前积分一个 dt，因此车辆暂时不动时不会让位置误差无限增长。
 
 ## 11. 关键安全语义与当前实现边界
 

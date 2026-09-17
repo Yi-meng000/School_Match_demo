@@ -39,6 +39,11 @@
 
 namespace rt = robot_control::trajectory;
 
+namespace
+{
+constexpr double kPi = 3.14159265358979323846;
+}
+
 class TracingNode : public rclcpp::Node
 {
 public:
@@ -85,8 +90,9 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "tracing_node: N=%d dt=%.3f, /plan=%s /odom=%s /cmd_track=%s; "
-      "map and odom are configured as numerically identical",
-      N_, dt_, plan_topic_.c_str(), odom_topic_.c_str(), cmd_track_topic_.c_str());
+      "map and odom are configured as numerically identical; odom yaw offset=%.3f rad (%.1f deg)",
+      N_, dt_, plan_topic_.c_str(), odom_topic_.c_str(), cmd_track_topic_.c_str(),
+      odom_yaw_offset_, odom_yaw_offset_ * 180.0 / kPi);
   }
 
 private:
@@ -98,7 +104,7 @@ private:
       throw std::invalid_argument("N must be positive and dt must be positive");
     }
 
-    motion_limits_.cruise_speed = declare_parameter<double>("cruise_speed", 1.2);
+    motion_limits_.cruise_speed = declare_parameter<double>("cruise_speed", 0.6);
     motion_limits_.max_accel = declare_parameter<double>("max_accel", 2.0);
     motion_limits_.normal_decel = declare_parameter<double>("normal_decel", 2.0);
     motion_limits_.emergency_decel = declare_parameter<double>("emergency_decel", 3.0);
@@ -123,6 +129,8 @@ private:
     generator_options_.profile_spacing = declare_parameter<double>("profile_spacing", 0.02);
     generator_options_.minimum_speed_for_time =
       declare_parameter<double>("minimum_speed_for_time", 1e-4);
+    generator_options_.max_reference_lead =
+      declare_parameter<double>("max_reference_lead", 0.10);
 
     q_diag_ << declare_parameter<double>("q_ex", 120.0),
       declare_parameter<double>("q_ey", 120.0),
@@ -148,6 +156,12 @@ private:
     goal_speed_tolerance_ = declare_parameter<double>("goal_speed_tolerance", 0.05);
     odom_timeout_ = declare_parameter<double>("odom_timeout", 0.30);
     plan_timeout_ = declare_parameter<double>("plan_timeout", 0.0);
+    // Temporary alignment for the current lidar odometry: when the chassis
+    // front points along world +x, its quaternion reports approximately +90
+    // degrees. Add -90 degrees so all downstream transforms use the physical
+    // chassis-forward yaw. Set this parameter to 0 after the odometry frame is
+    // corrected at its source.
+    odom_yaw_offset_ = declare_parameter<double>("odom_yaw_offset", -kPi / 2.0);
 
     plan_topic_ = declare_parameter<std::string>("plan_topic", "plan");
     odom_topic_ = declare_parameter<std::string>("odom_topic", "OdometryHighFreq");
@@ -249,10 +263,18 @@ private:
     mpc_state_.x = msg->pose.pose.position.x;
     mpc_state_.y = msg->pose.pose.position.y;
     const auto & q = msg->pose.pose.orientation;
-    mpc_state_.yaw = robot_control::tracing::yawFromQuaternion(q.x, q.y, q.z, q.w);
+    const double raw_odom_yaw =
+      robot_control::tracing::yawFromQuaternion(q.x, q.y, q.z, q.w);
+    mpc_state_.yaw = robot_control::tracing::normalizeYaw(raw_odom_yaw + odom_yaw_offset_);
     mpc_state_.vx = msg->twist.twist.linear.x;
     mpc_state_.vy = msg->twist.twist.linear.y;
     mpc_state_.vw = msg->twist.twist.angular.z;
+
+    RCLCPP_INFO_ONCE(
+      get_logger(),
+      "odometry yaw alignment: raw=%.3f rad (%.1f deg), corrected=%.3f rad (%.1f deg)",
+      raw_odom_yaw, raw_odom_yaw * 180.0 / kPi,
+      mpc_state_.yaw, mpc_state_.yaw * 180.0 / kPi);
 
     motion_state_.position = {mpc_state_.x, mpc_state_.y};
     motion_state_.velocity = robot_control::tracing::bodyVelocityToWorld(
@@ -553,6 +575,7 @@ private:
   double goal_speed_tolerance_{0.05};
   double odom_timeout_{0.30};
   double plan_timeout_{0.0};
+  double odom_yaw_offset_{-kPi / 2.0};
 
   std::string plan_topic_;
   std::string odom_topic_;

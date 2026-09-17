@@ -73,6 +73,7 @@ struct GeneratorOptions // 在线生成的配置
   double local_projection_lookahead{ 3.0 };  // 运行过程投影搜索前看距离 m
   double profile_spacing{ 0.02 };            // 速度包络离散使用的弧长间隔 m
   double minimum_speed_for_time{ 1e-4 };     // 时间表除零保护的最小速度 m/s
+  double max_reference_lead{ 0.10 };         // 名义速度相位最多领先实测投影的弧长 m
 };
 
 struct PathSample // 某弧长位置的平滑路径位置、单位切线、弧长、曲率
@@ -167,9 +168,10 @@ struct ReferencePoint // 参考轨迹点
   HeadingReference heading;
 }; 
 
-// Owns the currently accepted geometry and rebuilds its time parameterization from
-// measured state on each horizon request.  It is deliberately independent of ROS,
-// Eigen and any MPC state representation.
+// Owns the currently accepted geometry and a persistent nominal speed phase.
+// Each horizon is position-anchored to the latest measured projection while the
+// nominal phase advances across calls. Safety envelopes are still rebuilt from
+// measured state on every request.
 class TrajectoryGenerator
 {
 public:
@@ -234,9 +236,17 @@ private:
   TrajectoryDiagnostics diagnostics_;
   std::vector<ProfileNode> profile_;
   ExactSinusoid exact_nominal_;
+  std::vector<ProfileNode> reference_profile_;
+  ExactSinusoid reference_exact_nominal_;
+  double reference_time_{ 0.0 };
 
-  bool rebuildProfile(const MotionState2D& current_state);
-  ReferencePoint sampleProfile(double time_from_now, const HeadingProvider& heading_provider) const;
+  bool rebuildProfile(const MotionState2D& current_state, bool apply_nominal_shape);
+  ReferencePoint sampleProfile(const std::vector<ProfileNode>& profile, const ExactSinusoid& exact_nominal,
+                               double profile_time) const;
+  double profileSpeedAtArcLength(const std::vector<ProfileNode>& profile, double arc_length) const;
+  double profileDuration(const std::vector<ProfileNode>& profile, const ExactSinusoid& exact_nominal) const;
+  double profileTimeAtArcLength(const std::vector<ProfileNode>& profile, const ExactSinusoid& exact_nominal,
+                                double arc_length) const;
 };
 
 }  // namespace trajectory

@@ -38,5 +38,13 @@ inline double yawFromQuaternion(double x, double y, double z, double w)
     1.0 - 2.0 * (y * y + z * z));
 }
 
+// Keep corrected yaw in the principal interval after applying a fixed sensor
+// or frame-alignment offset.
+inline double normalizeYaw(double yaw)
+{
+  constexpr double kTwoPi = 6.28318530717958647692;
+  return std::remainder(yaw, kTwoPi);
+}
+
 }  // namespace tracing
 }  // namespace robot_control

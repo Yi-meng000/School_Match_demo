@@ -89,6 +89,21 @@ if(BUILD_TESTING)
     )
     target_compile_features(tracing_adapter_test PUBLIC cxx_std_14)
   endif()
+
+  ament_add_gtest(tracing_pipeline_test
+    test/tracing_pipeline_test.cpp
+  )
+  if(TARGET tracing_pipeline_test)
+    target_include_directories(tracing_pipeline_test PRIVATE
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    )
+    target_link_libraries(tracing_pipeline_test
+      translational_trajectory
+      Eigen3::Eigen
+      OsqpEigen::OsqpEigen
+    )
+    target_compile_features(tracing_pipeline_test PUBLIC cxx_std_14)
+  endif()
 endif()
 
 ament_package()

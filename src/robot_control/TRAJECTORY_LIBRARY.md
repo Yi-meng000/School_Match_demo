@@ -134,6 +134,7 @@ MotionLimits::isValid 会检查：
 | local_projection_lookahead | 3.0 m | 路径运行中，投影搜索的前看范围。 |
 | profile_spacing | 0.02 m | 速度包络离散使用的弧长间隔。 |
 | minimum_speed_for_time | 1e-4 m/s | 时间表除零保护的最小速度。 |
+| max_reference_lead | 0.10 m | 名义速度相位相对实测投影允许的最大弧长超前量；超过后暂停相位推进。 |
 
 ### 3.5 yaw 扩展接口 HeadingProvider
 
@@ -381,6 +382,17 @@ N = (-T_y, T_x)
 
 第一项是切向加速度，第二项是法向或向心加速度。
 
+### 5.7 滚动窗口中的持续速度相位
+
+路径激活时，生成器保存一份完整的名义 `time--s--v` 剖面，并把名义时间置零。之后每次
+`makeHorizon` 只把名义时间推进一个 `dt`，不会再从正弦加速段的 `t=0` 重新开始。因此即使
+车辆最初几拍尚未克服底盘死区，首参考速度也会持续增长，而不是永远重复第一拍的小速度。
+
+名义时间并非无限前跑：它最多比实测投影超前 `max_reference_lead`。同时，每个输出窗口的
+位置都从最新实测投影重新积分，第一参考位置只前进一个控制步，不会累计形成永久位置偏置。
+每周期仍会从实测位置和速度重建一份独立安全包络，用于曲率限速、加速度可达性、终点制动
+以及正常/紧急状态判断。最终参考同时满足持续名义相位和当前安全包络，MPC 本身未因此修改。
+
 ---
 
 ## 6. 如何调用新库
@@ -495,6 +507,11 @@ generator.makeHorizon(state, 0.05, 20, &horizon, heading_provider);
 不是 `map` 的路径，以及不是 `odom` / `base_link_hf` 的里程计。若以后地图定位引入
 真实的 `map->odom` 漂移，必须改用 tf2 统一坐标系后才能继续使用。
 
+当前雷达里程计还存在固定的车身朝向定义偏差：车头沿世界系 `+x` 时，四元数给出的 yaw
+约为 `+90 deg`。节点临时通过参数 `odom_yaw_offset=-1.57079632679 rad` 将原始 yaw
+减去 90 度；校正后的 yaw 统一用于里程计速度旋转、MPC 当前状态、固定 yaw 参考和参考
+速度反向旋转。雷达端修正坐标定义后，必须把该参数设回 `0.0`，避免重复校正。
+
 新库只接受世界系状态。Odometry 的 twist 在 child frame 中，因此实际转换为：
 
 ~~~
@@ -542,15 +559,16 @@ vy_ref_body = -sin(yaw_ref)*vx_world + cos(yaw_ref)*vy_world
 | --- | --- |
 | include/robot_control/translational_trajectory.hpp | 新库公开类型、配置、状态枚举、PathGeometry 和 TrajectoryGenerator 接口。 |
 | src/translational_trajectory.cpp | 新库实现：路径清洗、RDP、重采样、平滑、偏差检查、投影、曲率、速度包络、时间参数化、紧急状态。 |
-| test/translational_trajectory_test.cpp | 9 个 GTest：限制校验、异常与重复输入、自交路径投影、端点、起停、曲率、紧急制动、重规划和 yaw 透传。 |
+| test/translational_trajectory_test.cpp | 12 个 GTest：限制校验、异常与重复输入、自交路径投影、端点、单次与滚动起停、静止死区起步、单次与滚动曲率、紧急制动、重规划和 yaw 透传。 |
 
 ### MPC 和 ROS 适配
 
 | 文件 | 职责 |
 | --- | --- |
 | include/robot_control/mpc_controller.hpp | 基于 Eigen 与 OsqpEigen 的 MPC/QP；构建未来 N 步时变预测模型、限制速度增量，并允许寻迹节点在紧急制动时同步切换增量上限。 |
-| include/robot_control/tracing_adapter.hpp | 无 ROS 依赖的坐标辅助：机体系到世界系、世界系到参考机体系、四元数到平面 yaw。 |
-| test/tracing_adapter_test.cpp | 验证上述三项坐标适配。 |
+| include/robot_control/tracing_adapter.hpp | 无 ROS 依赖的坐标辅助：机体系到世界系、世界系到参考机体系、四元数到平面 yaw，以及固定偏置后的 yaw 归一化。 |
+| test/tracing_adapter_test.cpp | 验证上述坐标适配和固定 yaw 偏置归一化。 |
+| test/tracing_pipeline_test.cpp | 不修改 MPC 实现，串联持续相位轨迹窗口与现有 MPC，验证静止起步时 vx 命令不再停留在正弦第一拍。 |
 
 ### ROS 节点
 
@@ -575,10 +593,12 @@ colcon build --packages-select robot_control --cmake-args -DBUILD_TESTING=ON
 ~~~bash
 cd build/robot_control
 source /opt/ros/humble/setup.bash
-ctest --output-on-failure -R '^(translational_trajectory_test|tracing_adapter_test)$'
+ctest --output-on-failure -R '^(translational_trajectory_test|tracing_adapter_test|tracing_pipeline_test)$'
 ~~~
 
-当前结果：轨迹库的 9 个 GTest 和坐标适配的 3 个 GTest 全部通过。
+当前结果：轨迹库的 12 个 GTest、坐标适配的 4 个 GTest 和 1 个轨迹到现有 MPC 的管线测试
+全部通过。测试包含静止起步连续调用、完整滚动起步/巡航/停车、滚动弯道横向加速度约束，
+以及实测状态保持静止时现有 MPC 的纵向输出能够持续增长。
 
 ---
 

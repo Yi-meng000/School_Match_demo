@@ -147,6 +147,76 @@ TEST(TrajectoryGeneratorTest, StraightPathStopsWithBoundedAcceleration)
   EXPECT_NEAR(reference.back().speed, 0.0, 2e-3);
 }
 
+TEST(TrajectoryGeneratorTest, PersistentNominalPhaseEscapesStationaryStartup)
+{
+  const rt::PathGeometry path = buildPath({{0.0, 0.0}, {4.0, 0.0}});
+  rt::GeneratorOptions options;
+  options.max_reference_lead = 0.05;
+  rt::TrajectoryGenerator generator(limits(), options);
+  std::string error;
+  ASSERT_TRUE(generator.activatePath(path, stoppedState(), &error)) << error;
+
+  std::vector<double> first_speeds;
+  std::vector<rt::ReferencePoint> reference;
+  for (int tick = 0; tick < 12; ++tick) {
+    ASSERT_EQ(
+      generator.makeHorizon(stoppedState(), 0.05, 1, &reference),
+      rt::TrajectoryStatus::Ready);
+    ASSERT_EQ(reference.size(), 1u);
+    first_speeds.push_back(reference.front().speed);
+    // Position is re-anchored to the measured projection every cycle instead
+    // of accumulating the nominal profile's lead while the vehicle is stuck.
+    EXPECT_LT(reference.front().arc_length, 0.01);
+  }
+
+  EXPECT_GT(first_speeds[5], first_speeds.front() + 0.05);
+  EXPECT_NEAR(first_speeds.back(), limits().max_accel * 0.05, 2e-3);
+  EXPECT_NEAR(generator.diagnostics().progress, 0.0, 1e-12);
+
+  for (int tick = 0; tick < 200; ++tick) {
+    ASSERT_EQ(
+      generator.makeHorizon(stoppedState(), 0.05, 1, &reference),
+      rt::TrajectoryStatus::Ready);
+    ASSERT_EQ(reference.size(), 1u);
+    EXPECT_LT(reference.front().arc_length, 0.01);
+    EXPECT_LE(reference.front().speed, limits().max_accel * 0.05 + 1e-6);
+  }
+}
+
+TEST(TrajectoryGeneratorTest, RecedingHorizonReachesCruiseAndStops)
+{
+  const rt::PathGeometry path = buildPath({{0.0, 0.0}, {4.0, 0.0}});
+  rt::TrajectoryGenerator generator(limits());
+  rt::MotionState2D state = stoppedState();
+  std::string error;
+  ASSERT_TRUE(generator.activatePath(path, state, &error)) << error;
+
+  double maximum_speed = 0.0;
+  bool reached_end = false;
+  std::vector<rt::ReferencePoint> reference;
+  for (int tick = 0; tick < 1000; ++tick) {
+    const rt::TrajectoryStatus status = generator.makeHorizon(state, 0.02, 20, &reference);
+    ASSERT_NE(status, rt::TrajectoryStatus::EmergencyInfeasible)
+      << "normal_stop=" << generator.diagnostics().normal_stop_distance
+      << " emergency_stop=" << generator.diagnostics().emergency_stop_distance
+      << " deficit=" << generator.diagnostics().stop_deficit
+      << " terminal=" << generator.diagnostics().terminal_speed_if_unstoppable;
+    ASSERT_FALSE(reference.empty());
+    state.position = reference.front().position;
+    state.velocity = reference.front().velocity;
+    maximum_speed = std::max(maximum_speed, reference.front().speed);
+    if (generator.diagnostics().remaining_length < 1e-3 && reference.front().speed < 1e-3) {
+      reached_end = true;
+      break;
+    }
+  }
+
+  EXPECT_TRUE(reached_end);
+  EXPECT_GT(maximum_speed, 0.90);
+  EXPECT_NEAR(state.position.x, 4.0, 2e-3);
+  EXPECT_NEAR(std::hypot(state.velocity.x, state.velocity.y), 0.0, 2e-3);
+}
+
 TEST(TrajectoryGeneratorTest, CurvatureCapLimitsSpeed)
 {
   rt::PathBuildOptions options = pathOptions();
@@ -172,6 +242,53 @@ TEST(TrajectoryGeneratorTest, CurvatureCapLimitsSpeed)
       EXPECT_LE(point.speed, cap + 2e-3);
       const double normal_accel = std::fabs(point.curvature) * point.speed * point.speed;
       EXPECT_LE(normal_accel, limits().max_lateral_accel + 2e-3);
+    }
+  }
+  EXPECT_TRUE(observed_curve);
+}
+
+TEST(TrajectoryGeneratorTest, RecedingHorizonKeepsCurvatureAccelerationBounded)
+{
+  rt::PathBuildOptions options = pathOptions();
+  options.smooth_half_window = 0.12;
+  options.max_smooth_deviation = 0.20;
+  const rt::PathGeometry path =
+    buildPath({{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}, {2.0, 1.0}}, options);
+  rt::TrajectoryGenerator generator(limits());
+  rt::MotionState2D state = stoppedState();
+  std::string error;
+  ASSERT_TRUE(generator.activatePath(path, state, &error)) << error;
+
+  bool observed_curve = false;
+  std::vector<rt::ReferencePoint> reference;
+  for (int tick = 0; tick < 800; ++tick) {
+    SCOPED_TRACE(::testing::Message()
+      << "tick=" << tick
+      << " x=" << state.position.x
+      << " y=" << state.position.y
+      << " vx=" << state.velocity.x
+      << " vy=" << state.velocity.y
+      << " progress=" << generator.diagnostics().progress
+      << " remaining=" << generator.diagnostics().remaining_length);
+    const rt::TrajectoryStatus status = generator.makeHorizon(state, 0.02, 20, &reference);
+    ASSERT_NE(status, rt::TrajectoryStatus::EmergencyInfeasible)
+      << "normal_stop=" << generator.diagnostics().normal_stop_distance
+      << " emergency_stop=" << generator.diagnostics().emergency_stop_distance
+      << " deficit=" << generator.diagnostics().stop_deficit
+      << " terminal=" << generator.diagnostics().terminal_speed_if_unstoppable;
+    ASSERT_FALSE(reference.empty());
+    for (const rt::ReferencePoint & point : reference) {
+      if (std::fabs(point.curvature) > 0.10) {
+        observed_curve = true;
+      }
+      EXPECT_LE(
+        std::fabs(point.curvature) * point.speed * point.speed,
+        limits().max_lateral_accel + 3e-3);
+    }
+    state.position = reference.front().position;
+    state.velocity = reference.front().velocity;
+    if (generator.diagnostics().remaining_length < 1e-3 && reference.front().speed < 1e-3) {
+      break;
     }
   }
   EXPECT_TRUE(observed_curve);

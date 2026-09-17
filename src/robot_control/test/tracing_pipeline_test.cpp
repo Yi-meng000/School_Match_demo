@@ -13,7 +13,7 @@
 
 namespace rt = robot_control::trajectory;
 
-TEST(TracingPipelineTest, StationaryStartupCommandGrowsWithoutChangingMpc)
+TEST(TracingPipelineTest, StationaryStartupCommandGrowsWithinAccelerationLimit)
 {
   rt::MotionLimits limits;
   limits.cruise_speed = 1.2;
@@ -39,11 +39,12 @@ TEST(TracingPipelineTest, StationaryStartupCommandGrowsWithoutChangingMpc)
   constexpr double kDt = 0.05;
   robot_control::MpcController mpc(kHorizon, kDt);
   Eigen::Matrix<double, 6, 1> q_diag;
-  q_diag << 120.0, 120.0, 90.0, 2.0, 0.5, 2.0;
+  q_diag << 120.0, 120.0, 90.0, 20.0, 20.0, 2.0;
   const Eigen::Vector3d r_diag(1.5, 1.5, 0.8);
   const Eigen::Vector3d acceleration_limits(2.0, 3.0, 4.0);
   mpc.setErrorLimits(0.30, 0.5236);
   mpc.setWeights(q_diag, r_diag, acceleration_limits);
+  mpc.setReferenceRelativeSpeedLimit(0.05, limits.normal_decel);
 
   robot_control::State mpc_state;
   std::vector<double> vx_commands;
@@ -73,10 +74,46 @@ TEST(TracingPipelineTest, StationaryStartupCommandGrowsWithoutChangingMpc)
     vx_commands.push_back(command.vx);
     EXPECT_NEAR(command.vy, 0.0, 1e-6);
     EXPECT_NEAR(command.vw, 0.0, 1e-6);
-    EXPECT_LE(command.vx, limits.max_accel * kDt + 1e-5);
+    // OSQP absolute tolerance is 1e-4, so do not require a tighter numerical
+    // bound from the returned floating-point solution.
+    EXPECT_LE(command.vx, limits.max_accel * kDt + 1e-3);
   }
 
   ASSERT_FALSE(vx_commands.empty());
   EXPECT_GT(vx_commands.back(), vx_commands.front() + 0.05);
   EXPECT_GT(*std::max_element(vx_commands.begin(), vx_commands.end()), 0.08);
+}
+
+TEST(MpcControllerTest, ReferenceRelativeSpeedLimitPreventsPositionCatchupOverspeed)
+{
+  constexpr int kHorizon = 20;
+  constexpr double kDt = 0.05;
+  robot_control::MpcController mpc(kHorizon, kDt);
+  Eigen::Matrix<double, 6, 1> q_diag;
+  // Deliberately make position catch-up attractive.  The hard speed constraint
+  // must still win over this cost preference.
+  q_diag << 500.0, 500.0, 90.0, 1.0, 1.0, 2.0;
+  const Eigen::Vector3d r_diag(1.5, 1.5, 0.8);
+  const Eigen::Vector3d acceleration_limits(2.0, 2.0, 4.0);
+  mpc.setErrorLimits(0.30, 0.5236);
+  mpc.setWeights(q_diag, r_diag, acceleration_limits);
+  mpc.setReferenceRelativeSpeedLimit(0.05, 2.0);
+
+  robot_control::State state;
+  state.x = -10.0;  // Keep the saturated position error trying to accelerate.
+  state.vx = 0.60;
+  std::vector<robot_control::TrajectoryPoint> reference(kHorizon);
+  for (int i = 0; i < kHorizon; ++i) {
+    reference[static_cast<std::size_t>(i)].x = 0.20 * kDt * static_cast<double>(i + 1);
+    reference[static_cast<std::size_t>(i)].vx = 0.20;
+  }
+
+  robot_control::ControlCmd command;
+  ASSERT_TRUE(mpc.solveMPC(state, reference, command));
+
+  // The reference-related target is 0.20 + 0.05 m/s, but the initial
+  // 0.60 m/s can only reduce by 2.0 * 0.05 = 0.10 m/s in one step.
+  // Thus the first feasible cap is 0.50 m/s, not an instantaneous 0.25 m/s.
+  EXPECT_LE(std::hypot(command.vx, command.vy), 0.50 + 2e-3);
+  EXPECT_LT(command.vx, state.vx);
 }

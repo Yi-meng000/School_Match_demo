@@ -38,10 +38,9 @@ namespace robot_control
     public:
         MpcController(int N, double dt) : N_(N), dt_(dt) {
             // 前 3 项是位姿误差 [ex, ey, eyaw]，后 3 项是速度误差 [vx~, vy~, vw~]。
-            // 速度项不能全给 0：否则速度剖面的跟踪完全由位置环代偿，
-            // 实测会有 16%~32% 的速度超调。纵向和偏航通道给个小权重把剖面拉回来。
-            // 横向通道刻意留小 —— 全向底盘不需要压制横向速度，权重给大了会跟 ey 的横向纠偏打架。
-            q_diag_ << 120.0, 120.0, 90.0, 2.0, 0.5, 2.0;
+            // 平动速度误差必须有足够权重，否则优化器会为了追位置窗口而长期超出
+            // 速度参考。横向速度同样是全向底盘的平动速度，应当跟随对应参考分量。
+            q_diag_ << 120.0, 120.0, 90.0, 20.0, 20.0, 2.0;
             r_diag_ << 1.5, 1.5, 0.8;
             max_accel_ << 3.0, 3.0, 4.0;
         }
@@ -61,6 +60,18 @@ namespace robot_control
         void setAccelerationLimits(const Eigen::Vector3d& max_accel)
         {
             max_accel_ = max_accel;
+        }
+
+        // Limit the magnitude of each predicted planar command relative to
+        // the corresponding reference speed.  `tracking_margin` is a small
+        // allowance for position correction.  If the measured speed already
+        // exceeds that target, `braking_decel` creates a reachable decreasing
+        // bound instead of requesting an instantaneous, infeasible stop.
+        void setReferenceRelativeSpeedLimit(double tracking_margin, double braking_decel)
+        {
+            reference_speed_margin_ = std::max(0.0, tracking_margin);
+            reference_speed_braking_decel_ = std::max(1e-3, braking_decel);
+            reference_speed_limit_enabled_ = true;
         }
 
         // 初态误差限幅。路径切换（新障碍物让规划器重发了一条以当前位置为起点的
@@ -203,7 +214,7 @@ namespace robot_control
             // D 是已知扰动带来的仿射项，只进梯度
             Eigen::VectorXd g = 2.0 * Theta.transpose() * Q_big * (Psi * xi + D);
 
-            // 6. 物理加速度边界约束
+            // 6. 物理加速度边界约束。决策量是每步速度增量 delta_u。
             Eigen::VectorXd lb(dim_u);
             Eigen::VectorXd ub(dim_u);
             Eigen::Vector3d max_delta = max_accel_ * dt_;
@@ -212,8 +223,60 @@ namespace robot_control
                 ub.segment<3>(i * 3) =  max_delta;
             }
 
-            Eigen::SparseMatrix<double> Ac_sparse(dim_u, dim_u);
-            Ac_sparse.setIdentity();
+            // The acceleration bound alone does not constrain the accumulated
+            // command speed.  Add an 8-sided inscribed polygon for every
+            // predicted planar command:
+            //   ||u_xy[k]|| <= ||u_ref[k]|| + tracking_margin.
+            // A regular inner polygon keeps the QP linear while never allowing
+            // a vector outside the requested circular speed bound.
+            constexpr int kPlanarSpeedDirections = 8;
+            const int speed_constraint_count = reference_speed_limit_enabled_ ?
+                N_ * kPlanarSpeedDirections : 0;
+            const int constraint_count = dim_u + speed_constraint_count;
+            constexpr double kConstraintInfinity = 1e20;
+            constexpr double kPi = 3.14159265358979323846;
+            Eigen::MatrixXd constraint_dense = Eigen::MatrixXd::Zero(constraint_count, dim_u);
+            constraint_dense.topLeftCorner(dim_u, dim_u).setIdentity();
+            Eigen::VectorXd constraint_lower(constraint_count);
+            Eigen::VectorXd constraint_upper(constraint_count);
+            constraint_lower.head(dim_u) = lb;
+            constraint_upper.head(dim_u) = ub;
+
+            if (reference_speed_limit_enabled_) {
+                const double current_planar_speed = std::hypot(current_state.vx, current_state.vy);
+                const double polygon_inradius_ratio = std::cos(kPi / static_cast<double>(kPlanarSpeedDirections));
+                int row = dim_u;
+                for (int k = 0; k < N_; ++k) {
+                    const double reference_speed = std::hypot(ref_traj[k].vx, ref_traj[k].vy);
+                    const double target_speed = reference_speed + reference_speed_margin_;
+                    const double reachable_speed = std::max(
+                        0.0,
+                        current_planar_speed - reference_speed_braking_decel_ * dt_ * static_cast<double>(k + 1));
+                    const double speed_bound = std::max(target_speed, reachable_speed);
+                    const double polygon_inradius = speed_bound * polygon_inradius_ratio;
+
+                    for (int direction = 0; direction < kPlanarSpeedDirections; ++direction, ++row) {
+                        // Polygon normals lie halfway between its vertices, so
+                        // the vertices on the cardinal/diagonal directions are
+                        // exactly at speed_bound and the whole polygon lies in
+                        // the speed_bound circle.
+                        const double angle =
+                            (static_cast<double>(direction) + 0.5) * 2.0 * kPi /
+                            static_cast<double>(kPlanarSpeedDirections);
+                        const double nx = std::cos(angle);
+                        const double ny = std::sin(angle);
+                        for (int j = 0; j <= k; ++j) {
+                            constraint_dense(row, 3 * j) = nx;
+                            constraint_dense(row, 3 * j + 1) = ny;
+                        }
+                        constraint_lower(row) = -kConstraintInfinity;
+                        constraint_upper(row) = polygon_inradius -
+                            nx * current_state.vx - ny * current_state.vy;
+                    }
+                }
+            }
+
+            Eigen::SparseMatrix<double> Ac_sparse = constraint_dense.sparseView();
             Eigen::SparseMatrix<double> H_sparse = H_dense.sparseView();
 
             // 7. OSQP 求解
@@ -225,13 +288,13 @@ namespace robot_control
             solver.settings()->setMaxIteration(200);
 
             solver.data()->setNumberOfVariables(dim_u);
-            solver.data()->setNumberOfConstraints(dim_u);
+            solver.data()->setNumberOfConstraints(constraint_count);
 
             if (!solver.data()->setHessianMatrix(H_sparse)) return false;
             if (!solver.data()->setGradient(g)) return false;
             if (!solver.data()->setLinearConstraintsMatrix(Ac_sparse)) return false;
-            if (!solver.data()->setLowerBound(lb)) return false;
-            if (!solver.data()->setUpperBound(ub)) return false;
+            if (!solver.data()->setLowerBound(constraint_lower)) return false;
+            if (!solver.data()->setUpperBound(constraint_upper)) return false;
 
             if (!solver.initSolver()) return false;
             if (solver.solveProblem() != OsqpEigen::ErrorExitFlag::NoError) return false;
@@ -253,6 +316,9 @@ namespace robot_control
         Eigen::Matrix<double, 6, 1> q_diag_; 
         Eigen::Vector3d r_diag_; 
         Eigen::Vector3d max_accel_;
+        bool reference_speed_limit_enabled_{false};
+        double reference_speed_margin_{0.0};
+        double reference_speed_braking_decel_{1.0};
         Eigen::Vector3d e_max_{0.30, 0.30, M_PI / 6.0};  // 初态误差限幅 (m, m, rad)
     };
 }

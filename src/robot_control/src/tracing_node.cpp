@@ -61,6 +61,7 @@ public:
     mpc_ = std::make_unique<robot_control::MpcController>(N_, dt_);
     mpc_->setErrorLimits(e_xy_max_, e_yaw_max_);
     mpc_->setWeights(q_diag_, r_diag_, normal_mpc_accel_);
+    mpc_->setReferenceRelativeSpeedLimit(reference_speed_margin_, reference_speed_braking_decel_);
 
     rclcpp::QoS plan_qos(rclcpp::KeepLast(1));
     // nav_msgs/Path publishers normally use volatile durability.  Requesting
@@ -135,8 +136,8 @@ private:
     q_diag_ << declare_parameter<double>("q_ex", 120.0),
       declare_parameter<double>("q_ey", 120.0),
       declare_parameter<double>("q_eyaw", 90.0),
-      declare_parameter<double>("q_vx", 2.0),
-      declare_parameter<double>("q_vy", 0.5),
+      declare_parameter<double>("q_vx", 20.0),
+      declare_parameter<double>("q_vy", 20.0),
       declare_parameter<double>("q_vw", 2.0);
     r_diag_ << declare_parameter<double>("r_du_x", 1.5),
       declare_parameter<double>("r_du_y", 1.5),
@@ -149,6 +150,16 @@ private:
       declare_parameter<double>("emergency_a_max_x", motion_limits_.emergency_decel),
       declare_parameter<double>("emergency_a_max_y", motion_limits_.emergency_decel),
       declare_parameter<double>("emergency_a_max_w", normal_mpc_accel_(2));
+
+    reference_speed_margin_ = declare_parameter<double>("reference_speed_margin", 0.05);
+    reference_speed_braking_decel_ =
+      declare_parameter<double>("reference_speed_braking_decel", motion_limits_.normal_decel);
+    if (!std::isfinite(reference_speed_margin_) || reference_speed_margin_ < 0.0 ||
+      !std::isfinite(reference_speed_braking_decel_) || reference_speed_braking_decel_ <= 0.0)
+    {
+      throw std::invalid_argument(
+              "reference_speed_margin must be non-negative and reference_speed_braking_decel must be positive");
+    }
 
     e_xy_max_ = declare_parameter<double>("e_xy_max", 0.30);
     e_yaw_max_ = declare_parameter<double>("e_yaw_max", 0.5236);
@@ -518,6 +529,10 @@ private:
     mpc_->setAccelerationLimits(
       trajectory_status == rt::TrajectoryStatus::EmergencyBraking ?
       emergency_mpc_accel_ : normal_mpc_accel_);
+    mpc_->setReferenceRelativeSpeedLimit(
+      reference_speed_margin_,
+      trajectory_status == rt::TrajectoryStatus::EmergencyBraking ?
+      motion_limits_.emergency_decel : reference_speed_braking_decel_);
 
     robot_control::ControlCmd command;
     if (!mpc_->solveMPC(mpc_state_, mpc_reference, command)) {
@@ -579,6 +594,8 @@ private:
   Eigen::Vector3d r_diag_{};
   Eigen::Vector3d normal_mpc_accel_{};
   Eigen::Vector3d emergency_mpc_accel_{};
+  double reference_speed_margin_{0.05};
+  double reference_speed_braking_decel_{2.0};
   double e_xy_max_{0.30};
   double e_yaw_max_{0.5236};
   double goal_position_tolerance_{0.05};

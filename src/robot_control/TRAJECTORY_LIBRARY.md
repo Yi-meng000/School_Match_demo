@@ -6,10 +6,13 @@
 `SpeedProfile` 已删除。库本身保持纯 C++；ROS 适配、固定 yaw 和 MPC 坐标转换都在
 `tracing_node` 完成。
 
+如果需要按源码逐段阅读（包含节点从等待到运行的状态流、全部成员变量、函数和关键
+条件分支），请看 [TRACING_AND_TRAJECTORY_CODE_GUIDE.md](TRACING_AND_TRAJECTORY_CODE_GUIDE.md)。
+
 | 组成 | 文件 | 职责 |
 | --- | --- | --- |
 | 平动库 | include/robot_control/translational_trajectory.hpp、src/translational_trajectory.cpp | 世界系平动路径、速度包络、曲率限速和紧急制动诊断。 |
-| ROS 适配 | src/tracing_node.cpp | PlanPath、Odometry、遥控器寻迹开关、固定 yaw、MPC 参考和状态话题。 |
+| ROS 适配 | src/tracing_node.cpp | 当前临时接收 nav_msgs/Path；订阅 Odometry、遥控器寻迹开关，完成固定 yaw、MPC 参考和状态话题。 |
 | 坐标辅助 | include/robot_control/tracing_adapter.hpp | 世界系/机体系速度旋转及四元数 yaw 提取。 |
 
 新库输出世界坐标系的 vx、vy、ax、ay；MpcController 的速度误差状态则使用机体系
@@ -482,7 +485,7 @@ generator.makeHorizon(state, 0.05, 20, &horizon, heading_provider);
 
 | Topic | 类型 | QoS/坐标约定 | 用途 |
 | --- | --- | --- | --- |
-| `plan` | `robot_interfaces/PlanPath` | reliable + transient_local，depth 1；必须是 `map` | 新几何路径；`path_id` 仅在几何变化时递增。 |
+| `plan` | `nav_msgs/Path`（单路径测试） | reliable + volatile，depth 1；必须是 `map` | 仅缓存第一条成功构建的路径，后续消息忽略。 |
 | `OdometryHighFreq` | `nav_msgs/Odometry` | best-effort，depth 1；pose=`odom`，twist=`base_link_hf` | 实测位姿和机体系速度。 |
 | `cmd_controller` | `robot_interfaces/ControllerCmd` | reliable | 只使用 `trajectory` 字段作寻迹开关。 |
 | `cmd_track` | `geometry_msgs/Twist` | reliable，机体系 | MPC 输出；本轮尚未由 commmux 转发到底盘。 |
@@ -507,13 +510,16 @@ vy_ref_body = -sin(yaw_ref)*vx_world + cos(yaw_ref)*vy_world
 ~~~
 
 开关关闭时生成器清空并持续发布零 `cmd_track`，但缓存最后一条合法路径；开关上升沿锁住
-当前 yaw，并从当前位置向该缓存路径重新投影。启用后收到新 `path_id` 会立即重规划，保留
-锁定 yaw；同一 ID 只刷新可选的保活计时，绝不重置路径进度。
+当前 yaw，并从当前位置向该缓存路径重新投影。当前临时接口是单路径测试模式：只接受第一条
+成功构建的 `nav_msgs/Path`，后续 2 Hz 消息全部忽略，因此固定目标的重复路径不会影响进度。
+要测试另一条路径需重启 `tracing_node`。
 
-默认 `plan_timeout=0`，适合“仅路径变化时发布”的规划器。未来若规划器周期重发相同
-`path_id`，把该参数设置为正数即可要求保活。里程计超时始终生效，默认 `0.30 s`。
+默认 `plan_timeout=0`，适合单路径测试。等规划器升级到 PlanPath 后，节点会恢复“同一 ID
+只保活、不重置进度”的处理；此时规划器即使仍以 2 Hz 重发也没有问题。
+临时订阅使用 volatile durability 以兼容普通 nav_msgs/Path 发布者，因此节点晚于规划器启动时，
+规划器需要再发布一帧。里程计超时始终生效，默认 `0.30 s`。
 
-寻迹暂不使用 ROS Action：遥控器开关承担启停，`PlanPath` 是任务内的重规划更新，
+寻迹暂不使用 ROS Action：遥控器开关承担启停，当前 `nav_msgs/Path` 是任务内的重规划更新，
 `TrackingStatus` 提供进度和结果。以后需要行为树、抢占和客户端等待结果时，再在
 “目标输入—规划—寻迹完成”的整体外层添加 Action。
 
@@ -550,7 +556,7 @@ vy_ref_body = -sin(yaw_ref)*vx_world + cos(yaw_ref)*vy_world
 
 | 文件 | 职责 |
 | --- | --- |
-| src/tracing_node.cpp | 当前寻迹节点。缓存 PlanPath、订阅高频里程计和遥控器寻迹位；调用新平动库、锁定 yaw、适配到 MPC、发布 cmd_track 与 tracking_status；处理重规划、完成、超时和紧急状态。 |
+| src/tracing_node.cpp | 当前寻迹节点。临时缓存 nav_msgs/Path、订阅高频里程计和遥控器寻迹位；调用新平动库、锁定 yaw、适配到 MPC、发布 cmd_track 与 tracking_status；处理重规划、完成、超时和紧急状态。 |
 | src/commmux_node.cpp | 通信仲裁早期骨架。订阅 cmd_controller 并发布 cmd_chassis；同时发布空 tracing_input。自动/手动仲裁和 cmd_track 订阅仍是 TODO。 |
 
 ---

@@ -16,7 +16,7 @@
 #include <memory>
 using namespace std::chrono_literals;
 
-constexpr size_t kFrameSize = 24; // 蓝牙帧长度
+constexpr size_t kFrameSize = 25; // 蓝牙帧长度
 // std::string wifi_connect = "AT+CWJAP=iQOO Neo9S Pro,134795Frt\r\n";
         // std::string wifi_connect = "AT+CWJAP=iQOO 12,arcstar123\r\n";
         // write(serial_fd_, wifi_connect.c_str(), wifi_connect.length());
@@ -143,13 +143,14 @@ private:
             auto frame_msg = robot_interfaces::msg::ControllerCmd();
             frame_msg.enable = rx_buf_[1];
             frame_msg.protect = rx_buf_[2];
-            frame_msg.mode = rx_buf_[3];
-            memcpy(&frame_msg.goal_x, &rx_buf_[4], sizeof(uint16_t));
-            memcpy(&frame_msg.goal_y, &rx_buf_[6], sizeof(uint16_t));
-            memcpy(&frame_msg.goal_yaw, &rx_buf_[8], sizeof(uint16_t));
-            memcpy(&frame_msg.vx, &rx_buf_[10], sizeof(float));
-            memcpy(&frame_msg.vy, &rx_buf_[14], sizeof(float));
-            memcpy(&frame_msg.vw, &rx_buf_[18], sizeof(float));
+            frame_msg.lockpoint = rx_buf_[3];
+            frame_msg.trajectory = rx_buf_[4];
+            memcpy(&frame_msg.goal_x, &rx_buf_[5], sizeof(uint16_t));
+            memcpy(&frame_msg.goal_y, &rx_buf_[7], sizeof(uint16_t));
+            memcpy(&frame_msg.goal_yaw, &rx_buf_[9], sizeof(uint16_t));
+            memcpy(&frame_msg.vx, &rx_buf_[11], sizeof(float));
+            memcpy(&frame_msg.vy, &rx_buf_[15], sizeof(float));
+            memcpy(&frame_msg.vw, &rx_buf_[19], sizeof(float));
             pub_cmd_controller_->publish(frame_msg);
             rx_buf_.erase(rx_buf_.begin(), rx_buf_.begin() + kFrameSize); 
         }

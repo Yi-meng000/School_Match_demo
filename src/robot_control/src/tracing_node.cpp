@@ -2,7 +2,7 @@
  * Translational path-tracking ROS adapter.
  *
  * Inputs:
- *   /plan             robot_interfaces/PlanPath, map frame
+ *   /plan             nav_msgs/Path, map frame
  *   /OdometryHighFreq nav_msgs/Odometry, odom pose + base_link_hf twist
  *   /cmd_controller   ControllerCmd.trajectory is the tracking enable switch
  * Outputs:
@@ -18,8 +18,8 @@
 
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
+#include "nav_msgs/msg/path.hpp"
 #include "robot_interfaces/msg/controller_cmd.hpp"
-#include "robot_interfaces/msg/plan_path.hpp"
 #include "robot_interfaces/msg/tracking_status.hpp"
 
 #include "robot_control/mpc_controller.hpp"
@@ -58,8 +58,10 @@ public:
     mpc_->setWeights(q_diag_, r_diag_, normal_mpc_accel_);
 
     rclcpp::QoS plan_qos(rclcpp::KeepLast(1));
-    plan_qos.reliable().transient_local();
-    sub_plan_ = create_subscription<robot_interfaces::msg::PlanPath>(
+    // nav_msgs/Path publishers normally use volatile durability.  Requesting
+    // transient_local here would make this subscriber incompatible with them.
+    plan_qos.reliable().durability_volatile();
+    sub_plan_ = create_subscription<nav_msgs::msg::Path>(
       plan_topic_, plan_qos,
       std::bind(&TracingNode::planCallback, this, std::placeholders::_1));
     sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -167,21 +169,29 @@ private:
     return msg.header.frame_id == odom_frame_ && msg.child_frame_id == base_frame_;
   }
 
-  void planCallback(const robot_interfaces::msg::PlanPath::SharedPtr msg)
+  void planCallback(const nav_msgs::msg::Path::SharedPtr msg)
   {
+    // Temporary single-path test mode: after the first usable path is cached,
+    // ignore every later message.  The planner currently publishes at 2 Hz
+    // without a path_id, so treating them as replans would perturb a fixed-path
+    // tracking test.  Restart tracing_node to select another test path.
+    if (have_cached_path_) {
+      last_valid_plan_t_ = now();
+      RCLCPP_DEBUG_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "ignoring nav_msgs/Path: single-path test mode already has a cached path");
+      return;
+    }
+
     if (!validPlanFrame(msg->header.frame_id)) {
       rejectPath(
-        msg->path_id,
         "Plan frame '" + msg->header.frame_id + "' does not match expected '" + path_frame_ + "'");
       return;
     }
 
-    // A matching ID is either a heartbeat or a latched replay.  It must not
-    // re-anchor the trajectory because that would erase forward progress.
-    if (have_cached_path_ && msg->path_id == current_path_id_) {
-      last_valid_plan_t_ = now();
-      return;
-    }
+    // Temporary planner interface: nav_msgs/Path has no path_id.  The first
+    // valid message is used as the fixed test path.  When the planner switches
+    // to PlanPath, restore same-ID heartbeat filtering and new-ID replanning.
 
     std::vector<rt::Point2> points;
     points.reserve(msg->poses.size());
@@ -192,21 +202,20 @@ private:
     rt::PathGeometry candidate;
     std::string error;
     if (!candidate.build(points, path_options_, &error)) {
-      rejectPath(msg->path_id, "Cannot build path: " + error);
+      rejectPath("Cannot build path: " + error);
       return;
     }
 
     cached_path_ = std::move(candidate);
     have_cached_path_ = true;
-    current_path_id_ = msg->path_id;
     last_valid_plan_t_ = now();
     goal_reached_ = false;
     emergency_stop_ = false;
     path_activation_rejected_ = false;
 
     RCLCPP_INFO(
-      get_logger(), "received path_id=%u: %zu samples, %.3f m, max smooth deviation %.4f m",
-      current_path_id_, cached_path_.size(), cached_path_.length(),
+      get_logger(), "received nav_msgs/Path: %zu samples, %.3f m, max smooth deviation %.4f m",
+      cached_path_.size(), cached_path_.length(),
       cached_path_.maxSmoothDeviation());
 
     if (tracking_enabled_) {
@@ -317,9 +326,8 @@ private:
     return true;
   }
 
-  void rejectPath(uint32_t path_id, const std::string & detail)
+  void rejectPath(const std::string & detail)
   {
-    current_path_id_ = path_id;
     have_cached_path_ = false;
     goal_reached_ = false;
     emergency_stop_ = false;
@@ -338,8 +346,7 @@ private:
     publishZero();
     publishStatus(robot_interfaces::msg::TrackingStatus::PATH_REJECTED, detail);
     RCLCPP_ERROR_THROTTLE(
-      get_logger(), *get_clock(), 1000, "path_id=%u rejected: %s",
-      current_path_id_, detail.c_str());
+      get_logger(), *get_clock(), 1000, "path rejected: %s", detail.c_str());
   }
 
   void controlTick()
@@ -433,8 +440,8 @@ private:
         "emergency deceleration cannot stop before path end");
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 500,
-        "path_id=%u emergency infeasible: remaining=%.3f m residual=%.3f m/s -> zero command",
-        current_path_id_, diagnostics_.remaining_length,
+        "path emergency infeasible: remaining=%.3f m residual=%.3f m/s -> zero command",
+        diagnostics_.remaining_length,
         diagnostics_.terminal_speed_if_unstoppable);
       return;
     }
@@ -500,8 +507,8 @@ private:
         "normal braking insufficient; emergency profile active");
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 500,
-        "path_id=%u emergency braking: remaining=%.3f m normal deficit=%.3f m",
-        current_path_id_, diagnostics_.remaining_length, diagnostics_.stop_deficit);
+        "path emergency braking: remaining=%.3f m normal deficit=%.3f m",
+        diagnostics_.remaining_length, diagnostics_.stop_deficit);
     } else {
       publishStatus(robot_interfaces::msg::TrackingStatus::TRACKING, "tracking");
     }
@@ -518,7 +525,9 @@ private:
     status.header.stamp = now();
     status.header.frame_id = path_frame_;
     status.has_path = have_cached_path_;
-    status.path_id = current_path_id_;
+    // nav_msgs/Path has no path_id.  Keep the existing status message ABI, but
+    // report 0 until the planner migrates to robot_interfaces/PlanPath.
+    status.path_id = 0U;
     status.state = state;
     status.progress = diagnostics_.progress;
     status.remaining_distance = diagnostics_.remaining_length;
@@ -568,7 +577,6 @@ private:
   bool goal_reached_{false};
   bool emergency_stop_{false};
   bool path_activation_rejected_{false};
-  uint32_t current_path_id_{0};
   double locked_yaw_{0.0};
   std::string last_odom_error_;
 
@@ -577,7 +585,7 @@ private:
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_track_;
   rclcpp::Publisher<robot_interfaces::msg::TrackingStatus>::SharedPtr pub_status_;
-  rclcpp::Subscription<robot_interfaces::msg::PlanPath>::SharedPtr sub_plan_;
+  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr sub_plan_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
   rclcpp::Subscription<robot_interfaces::msg::ControllerCmd>::SharedPtr sub_controller_;
   rclcpp::TimerBase::SharedPtr timer_;

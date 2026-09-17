@@ -321,6 +321,8 @@ v_curve(s) = sqrt(max_lateral_accel / |kappa(s)|)
 v_cap = min(cruise_speed, v_curve, v_nominal)
 ~~~
 
+`cruise_speed` 是期望巡航目标，不是要求实测速度在当前瞬间必须低于它的安全边界。若控制器反馈的切向速度暂时高于巡航值、前方没有更低的曲率限速，包络会按 `normal_decel` 在可用距离内把它平滑降回巡航值；这不会误报为 `EmergencyInfeasible`。曲率限速和终点 `terminal_speed` 仍是硬约束，绝不因这项放宽而提高。
+
 然后从终点向前递推：
 
 ~~~

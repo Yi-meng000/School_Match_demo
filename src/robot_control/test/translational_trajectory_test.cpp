@@ -183,6 +183,26 @@ TEST(TrajectoryGeneratorTest, PersistentNominalPhaseEscapesStationaryStartup)
   }
 }
 
+TEST(TrajectoryGeneratorTest, OverspeedAboveCruiseBrakesWithoutFalseEmergencyStop)
+{
+  const rt::PathGeometry path = buildPath({{0.0, 0.0}, {2.0, 0.0}});
+  rt::TrajectoryGenerator generator(limits());
+  // The vehicle is only 15% above its 1.0 m/s cruise target and has ample
+  // straight distance to decelerate.  This is not an emergency-infeasible
+  // condition, even though the measured start speed exceeds cruise_speed.
+  const rt::MotionState2D overspeed{{0.0, 0.0}, {1.15, 0.0}};
+  std::string error;
+  ASSERT_TRUE(generator.activatePath(path, overspeed, &error)) << error;
+
+  std::vector<rt::ReferencePoint> reference;
+  EXPECT_EQ(
+    generator.makeHorizon(overspeed, 0.02, 20, &reference),
+    rt::TrajectoryStatus::Ready);
+  ASSERT_FALSE(reference.empty());
+  EXPECT_LT(reference.back().speed, overspeed.velocity.x);
+  EXPECT_GT(reference.back().speed, 0.0);
+}
+
 TEST(TrajectoryGeneratorTest, RecedingHorizonReachesCruiseAndStops)
 {
   const rt::PathGeometry path = buildPath({{0.0, 0.0}, {4.0, 0.0}});

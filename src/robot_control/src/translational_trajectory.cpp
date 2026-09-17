@@ -14,6 +14,7 @@ namespace
 constexpr double kEps = 1e-9;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kSpeedFeasibilityTolerance = 1e-3;
+constexpr double kNoLocalSpeedCap = 1e3;
 
 bool finite(double value)
 {
@@ -835,7 +836,11 @@ bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state, boo
       std::unique(arc_lengths.begin(), arc_lengths.end(), [](double a, double b) { return std::fabs(a - b) < 1e-10; }),
       arc_lengths.end());
   const std::size_t node_count = arc_lengths.size();
-  std::vector<double> caps(node_count, limits_.cruise_speed);
+  // Keep curvature limits separate from the normal cruise target.  A measured
+  // speed can temporarily exceed cruise_speed and still be safely reduced over
+  // distance; it must not be treated as an immediately infeasible constraint.
+  // Curvature limits below cruise_speed and terminal speed remain hard limits.
+  std::vector<double> curve_caps(node_count, kNoLocalSpeedCap);
   const NominalSpeedShape nominal = [&]() {
     NominalSpeedShape shape;
     shape.build(remaining, initial_speed, limits_);
@@ -848,13 +853,8 @@ bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state, boo
     const double curvature = std::fabs(path_sample.curvature);
     if (curvature > 1e-8)
     {
-      caps[i] = std::min(caps[i], std::sqrt(limits_.max_lateral_accel / curvature));
+      curve_caps[i] = std::min(curve_caps[i], std::sqrt(limits_.max_lateral_accel / curvature));
     }
-    if (apply_nominal_shape && nominal.valid)
-    {
-      caps[i] = std::min(caps[i], nominal.speedAt(arc_lengths[i] - progress_));
-    }
-    caps[i] = std::max(0.0, caps[i]);
   }
   // Cap both ends of each profile segment by that segment's maximum curvature.
   // This is deliberately conservative over one small segment, but guarantees
@@ -867,8 +867,37 @@ bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state, boo
     if (max_curvature > 1e-8)
     {
       const double segment_cap = std::sqrt(limits_.max_lateral_accel / max_curvature);
-      caps[i] = std::min(caps[i], segment_cap);
-      caps[i + 1] = std::min(caps[i + 1], segment_cap);
+      curve_caps[i] = std::min(curve_caps[i], segment_cap);
+      curve_caps[i + 1] = std::min(curve_caps[i + 1], segment_cap);
+    }
+  }
+
+  std::vector<double> caps(node_count, limits_.cruise_speed);
+  for (std::size_t i = 0; i < node_count; ++i)
+  {
+    caps[i] = std::min(caps[i], curve_caps[i]);
+    if (apply_nominal_shape && nominal.valid)
+    {
+      caps[i] = std::min(caps[i], nominal.speedAt(arc_lengths[i] - progress_));
+    }
+    caps[i] = std::max(0.0, caps[i]);
+  }
+
+  if (!apply_nominal_shape && initial_speed > limits_.cruise_speed + kSpeedFeasibilityTolerance)
+  {
+    // Relax only the cruise cap while the vehicle can decelerate to it under
+    // normal braking.  Do not relax a tighter curvature cap or the terminal
+    // stop requirement: those remain safety constraints.
+    for (std::size_t i = 0; i + 1 < node_count; ++i)
+    {
+      if (curve_caps[i] + kSpeedFeasibilityTolerance < limits_.cruise_speed)
+      {
+        continue;
+      }
+      const double distance_from_start = arc_lengths[i] - progress_;
+      const double normal_braking_speed = std::sqrt(std::max(
+        0.0, initial_speed * initial_speed - 2.0 * limits_.normal_decel * distance_from_start));
+      caps[i] = std::max(caps[i], normal_braking_speed);
     }
   }
   caps.back() = std::min(caps.back(), limits_.terminal_speed);

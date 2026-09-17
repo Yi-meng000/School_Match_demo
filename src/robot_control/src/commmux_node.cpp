@@ -2,7 +2,6 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "robot_interfaces/msg/chassis_cmd.hpp"
 #include "robot_interfaces/msg/controller_cmd.hpp"
-#include "robot_interfaces/msg/tracing_input.hpp"
 #include <chrono>
 using namespace std::chrono_literals;
 

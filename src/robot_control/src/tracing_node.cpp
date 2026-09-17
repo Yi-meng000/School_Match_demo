@@ -266,15 +266,25 @@ private:
     const double raw_odom_yaw =
       robot_control::tracing::yawFromQuaternion(q.x, q.y, q.z, q.w);
     mpc_state_.yaw = robot_control::tracing::normalizeYaw(raw_odom_yaw + odom_yaw_offset_);
-    mpc_state_.vx = msg->twist.twist.linear.x;
-    mpc_state_.vy = msg->twist.twist.linear.y;
+    // nav_msgs/Odometry expresses twist in child_frame_id.  The current lidar
+    // odometry child frame is yaw-offset from the physical chassis by the same
+    // fixed amount as its quaternion.  Therefore transform twist into the
+    // physical chassis frame before using it as MPC feedback.  With the
+    // temporary -90 deg yaw correction this is R(+90 deg):
+    //   vx_chassis = -vy_raw, vy_chassis = vx_raw.
+    const rt::Vector2 chassis_velocity = robot_control::tracing::rotatePlanarVelocity(
+      -odom_yaw_offset_, msg->twist.twist.linear.x, msg->twist.twist.linear.y);
+    mpc_state_.vx = chassis_velocity.x;
+    mpc_state_.vy = chassis_velocity.y;
     mpc_state_.vw = msg->twist.twist.angular.z;
 
     RCLCPP_INFO_ONCE(
       get_logger(),
-      "odometry yaw alignment: raw=%.3f rad (%.1f deg), corrected=%.3f rad (%.1f deg)",
+      "odometry alignment: raw yaw=%.3f rad (%.1f deg), corrected yaw=%.3f rad (%.1f deg), "
+      "twist rotation=%.3f rad (%.1f deg)",
       raw_odom_yaw, raw_odom_yaw * 180.0 / kPi,
-      mpc_state_.yaw, mpc_state_.yaw * 180.0 / kPi);
+      mpc_state_.yaw, mpc_state_.yaw * 180.0 / kPi,
+      -odom_yaw_offset_, -odom_yaw_offset_ * 180.0 / kPi);
 
     motion_state_.position = {mpc_state_.x, mpc_state_.y};
     motion_state_.velocity = robot_control::tracing::bodyVelocityToWorld(

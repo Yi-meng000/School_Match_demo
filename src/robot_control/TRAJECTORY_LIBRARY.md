@@ -507,16 +507,18 @@ generator.makeHorizon(state, 0.05, 20, &horizon, heading_provider);
 不是 `map` 的路径，以及不是 `odom` / `base_link_hf` 的里程计。若以后地图定位引入
 真实的 `map->odom` 漂移，必须改用 tf2 统一坐标系后才能继续使用。
 
-当前雷达里程计还存在固定的车身朝向定义偏差：车头沿世界系 `+x` 时，四元数给出的 yaw
-约为 `+90 deg`。节点临时通过参数 `odom_yaw_offset=-1.57079632679 rad` 将原始 yaw
-减去 90 度；校正后的 yaw 统一用于里程计速度旋转、MPC 当前状态、固定 yaw 参考和参考
-速度反向旋转。雷达端修正坐标定义后，必须把该参数设回 `0.0`，避免重复校正。
+当前雷达里程计还存在固定的 child frame 定义偏差：车头沿世界系 `+x` 时，四元数给出的
+yaw 约为 `+90 deg`。节点临时通过参数 `odom_yaw_offset=-1.57079632679 rad` 将原始 yaw
+减去 90 度，并将 raw twist 乘 `R(-odom_yaw_offset)` 后再作为 MPC 速度反馈。当前值下即
+`vx_chassis=-vy_raw, vy_chassis=vx_raw`。雷达端修正坐标定义后，必须把该参数设回 `0.0`，
+避免重复校正。
 
-新库只接受世界系状态。Odometry 的 twist 在 child frame 中，因此实际转换为：
+新库只接受世界系状态。Odometry 的 raw twist 先转换到物理车体系，再转换到世界系：
 
 ~~~
-vx_world = cos(yaw)*vx_body - sin(yaw)*vy_body
-vy_world = sin(yaw)*vx_body + cos(yaw)*vy_body
+v_chassis = R(-odom_yaw_offset) * v_raw
+vx_world = cos(yaw)*vx_chassis - sin(yaw)*vy_chassis
+vy_world = sin(yaw)*vx_chassis + cos(yaw)*vy_chassis
 ~~~
 
 固定 yaw 的参考速度需反向转进 MPC 的参考机体系：

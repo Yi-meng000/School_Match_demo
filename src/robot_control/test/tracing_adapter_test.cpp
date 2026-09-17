@@ -46,3 +46,20 @@ TEST(TracingAdapterTest, AppliesCurrentLidarYawAlignmentOffset)
   EXPECT_GT(body_reference.x, 0.999);
   EXPECT_NEAR(body_reference.y, -std::sin(corrected_yaw), 1e-12);
 }
+
+TEST(TracingAdapterTest, AppliesSameFrameAlignmentToLidarTwist)
+{
+  // The lidar child frame reports +90 deg when the physical chassis faces
+  // world +x.  A forward physical velocity is therefore (0, -v) in that raw
+  // child frame.  Correct yaw by -90 deg and rotate the twist by +90 deg.
+  constexpr double kYawOffset = -M_PI_2;
+  const rt::Vector2 chassis_velocity = tracing::rotatePlanarVelocity(
+    -kYawOffset, 0.0, -0.2);
+  const rt::Vector2 world_velocity = tracing::bodyVelocityToWorld(
+    M_PI_2 + kYawOffset, chassis_velocity.x, chassis_velocity.y);
+
+  EXPECT_NEAR(chassis_velocity.x, 0.2, 1e-12);
+  EXPECT_NEAR(chassis_velocity.y, 0.0, 1e-12);
+  EXPECT_NEAR(world_velocity.x, 0.2, 1e-12);
+  EXPECT_NEAR(world_velocity.y, 0.0, 1e-12);
+}

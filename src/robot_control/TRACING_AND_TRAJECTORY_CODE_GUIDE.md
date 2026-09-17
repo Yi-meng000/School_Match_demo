@@ -216,7 +216,7 @@ controlTick()（L345--508）每个周期按下列优先级检查。上面的条�
 | goal_position_tolerance_ / goal_speed_tolerance_ | 0.05 m / 0.05 m/s | GOAL_REACHED 的双条件阈值。 |
 | odom_timeout_ | 0.30 s | 最后里程计超过此时长便停车。 |
 | plan_timeout_ | 0 s | 0 表示不要求规划器周期保活；临时 nav_msgs/Path 接口应保持 0，等 path_id 接口恢复后才适合正数保活。 |
-| odom_yaw_offset_ | -1.57079632679 rad | 临时补偿雷达里程计相对实际车头的 +90 度固定朝向偏差；雷达端修正后设为 0。 |
+| odom_yaw_offset_ | -1.57079632679 rad | 临时补偿雷达 child frame 相对实际车头的 +90 度固定偏差；同一偏置的反向旋转也用于把 twist 转进真实车体系。雷达端修正后设为 0。 |
 | *_topic_ | 见源码 L150--154 | 允许 launch 文件改话题名。 |
 | path_frame_ / odom_frame_ / base_frame_ | map / odom / base_link_hf | 严格检查输入坐标系标识。 |
 
@@ -290,9 +290,9 @@ validOdomFrames 同时检查两项：
 | 行 | 做的事 | 为什么 |
 | --- | --- | --- |
 | L225--235 | frame 不合法：置 have_odom_=false，记录文本，清空激活轨迹并立即发零。 | 不在坐标语义不明时控制车辆。 |
-| L238--246 | 记录当前时间；把 pose 写入 x/y/yaw，把 twist 原样写入 MPC 的 vx/vy/vw。 | MPC 期待当前速度在底盘系。 |
-| L242--243 | quaternion 经 yawFromQuaternion 取原始平面偏航角，再加 odom_yaw_offset 并归一化。 | 当前默认减 90 度，使车头沿世界 +x 时校正 yaw 接近 0；所有后续旋转必须共用此校正值。 |
-| L248--250 | 位置直接复用；机体系线速度用当前 yaw 旋转到世界系。 | 轨迹库依靠速度在路径切线上的投影来确定初速度。 |
+| L238--246 | 记录当前时间；把 pose 写入 x/y/yaw；将 raw twist 旋转到物理车体系后写入 MPC 的 vx/vy/vw。 | MPC 期待当前速度在底盘系，不能混入雷达 child frame 的分量。 |
+| L242--250 | quaternion 经 yawFromQuaternion 取原始平面偏航角，再加 odom_yaw_offset 并归一化；raw twist 同时乘 R(-odom_yaw_offset)。 | 当前默认 yaw 减 90 度，twist 则加 90 度：`vx_chassis=-vy_raw, vy_chassis=vx_raw`，两者共同使车头沿世界 +x 时的姿态与速度语义一致。 |
+| L252--254 | 位置直接复用；已校正的机体系线速度用当前 yaw 旋转到世界系。 | 轨迹库依靠速度在路径切线上的投影来确定初速度。 |
 | L251 | 置 have_odom_=true。 | 允许 controlTick 进入下一阶段。 |
 | L253--260 | 若已开、已有路径、还未激活、且没有终点/急停/拒绝锁存，尝试激活。 | 支持开关和路径均早到、里程计最后到的顺序。 |
 

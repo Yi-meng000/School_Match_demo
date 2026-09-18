@@ -105,14 +105,14 @@ private:
       throw std::invalid_argument("N must be positive and dt must be positive");
     }
 
-    motion_limits_.cruise_speed = declare_parameter<double>("cruise_speed", 0.6);
+    motion_limits_.cruise_speed = declare_parameter<double>("cruise_speed", 0.6); // 巡航速度
     motion_limits_.max_accel = declare_parameter<double>("max_accel", 2.0);
     motion_limits_.normal_decel = declare_parameter<double>("normal_decel", 2.0);
     motion_limits_.emergency_decel = declare_parameter<double>("emergency_decel", 3.0);
     motion_limits_.max_lateral_accel = declare_parameter<double>("max_lateral_accel", 3.0);
     motion_limits_.terminal_speed = declare_parameter<double>("terminal_speed", 0.0);
-    motion_limits_.accel_fraction = declare_parameter<double>("accel_fraction", 0.20);
-    motion_limits_.decel_fraction = declare_parameter<double>("decel_fraction", 0.25);
+    motion_limits_.accel_fraction = declare_parameter<double>("accel_fraction", 0.20);  // 加速段占比
+    motion_limits_.decel_fraction = declare_parameter<double>("decel_fraction", 0.25);  // 减速段占比
 
     path_options_.sample_spacing = declare_parameter<double>("sample_spacing", 0.02);
     path_options_.rdp_epsilon = declare_parameter<double>("rdp_epsilon", 0.03);
@@ -167,12 +167,11 @@ private:
     goal_speed_tolerance_ = declare_parameter<double>("goal_speed_tolerance", 0.05);
     odom_timeout_ = declare_parameter<double>("odom_timeout", 0.30);
     plan_timeout_ = declare_parameter<double>("plan_timeout", 0.0);
-    // Temporary alignment for the current lidar odometry: when the chassis
-    // front points along world +x, its quaternion reports approximately +90
-    // degrees. Add -90 degrees so all downstream transforms use the physical
-    // chassis-forward yaw. Set this parameter to 0 after the odometry frame is
-    // corrected at its source.
-    odom_yaw_offset_ = declare_parameter<double>("odom_yaw_offset", -kPi / 2.0);
+    // The lidar odometry now publishes quaternion yaw and child-frame twist in
+    // the physical chassis convention, so no correction is applied by default.
+    // Keep this parameter only as a deliberate compatibility escape hatch for
+    // an old or differently aligned odometry publisher.
+    odom_yaw_offset_ = declare_parameter<double>("odom_yaw_offset", 0.0);
 
     plan_topic_ = declare_parameter<std::string>("plan_topic", "plan");
     odom_topic_ = declare_parameter<std::string>("odom_topic", "OdometryHighFreq");
@@ -278,11 +277,9 @@ private:
       robot_control::tracing::yawFromQuaternion(q.x, q.y, q.z, q.w);
     mpc_state_.yaw = robot_control::tracing::normalizeYaw(raw_odom_yaw + odom_yaw_offset_);
     // nav_msgs/Odometry expresses twist in child_frame_id.  The current lidar
-    // odometry child frame is yaw-offset from the physical chassis by the same
-    // fixed amount as its quaternion.  Therefore transform twist into the
-    // physical chassis frame before using it as MPC feedback.  With the
-    // temporary -90 deg yaw correction this is R(+90 deg):
-    //   vx_chassis = -vy_raw, vy_chassis = vx_raw.
+    // publisher's child frame is the physical chassis frame, so with the
+    // default zero offset this is an identity transform.  A nonzero parameter
+    // remains available only for an explicitly known legacy frame alignment.
     const rt::Vector2 chassis_velocity = robot_control::tracing::rotatePlanarVelocity(
       -odom_yaw_offset_, msg->twist.twist.linear.x, msg->twist.twist.linear.y);
     mpc_state_.vx = chassis_velocity.x;
@@ -602,7 +599,7 @@ private:
   double goal_speed_tolerance_{0.05};
   double odom_timeout_{0.30};
   double plan_timeout_{0.0};
-  double odom_yaw_offset_{-kPi / 2.0};
+  double odom_yaw_offset_{0.0};
 
   std::string plan_topic_;
   std::string odom_topic_;

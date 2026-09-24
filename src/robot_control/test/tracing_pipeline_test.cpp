@@ -58,14 +58,12 @@ TEST(TracingPipelineTest, StationaryStartupCommandGrowsWithinAccelerationLimit)
     std::vector<robot_control::TrajectoryPoint> mpc_reference;
     mpc_reference.reserve(reference.size());
     for (const rt::ReferencePoint & point : reference) {
-      const rt::Vector2 body_velocity =
-        robot_control::tracing::worldVelocityToBody(0.0, point.velocity);
       robot_control::TrajectoryPoint mpc_point;
       mpc_point.x = point.position.x;
       mpc_point.y = point.position.y;
       mpc_point.yaw = 0.0;
-      mpc_point.vx = body_velocity.x;
-      mpc_point.vy = body_velocity.y;
+      mpc_point.vx = point.velocity.x;
+      mpc_point.vy = point.velocity.y;
       mpc_reference.push_back(mpc_point);
     }
 
@@ -82,6 +80,65 @@ TEST(TracingPipelineTest, StationaryStartupCommandGrowsWithinAccelerationLimit)
   ASSERT_FALSE(vx_commands.empty());
   EXPECT_GT(vx_commands.back(), vx_commands.front() + 0.05);
   EXPECT_GT(*std::max_element(vx_commands.begin(), vx_commands.end()), 0.08);
+}
+
+TEST(TracingPipelineTest, MpcPlanarVelocityContractRemainsWorldFrameAtNonzeroYaw)
+{
+  constexpr int kHorizon = 20;
+  constexpr double kDt = 0.05;
+  constexpr double kYaw = M_PI_2;
+
+  // A chassis-frame velocity (0, -0.4) at +90 deg yaw is world-frame +x.
+  const rt::Vector2 measured_world =
+    robot_control::tracing::bodyVelocityToWorld(kYaw, 0.0, -0.4);
+
+  robot_control::State state;
+  state.yaw = kYaw;
+  state.vx = measured_world.x;
+  state.vy = measured_world.y;
+
+  std::vector<robot_control::TrajectoryPoint> reference(kHorizon);
+  for (robot_control::TrajectoryPoint & point : reference) {
+    point.yaw = kYaw;
+    point.vx = 0.4;  // world +x, deliberately not reference-body +x
+    point.vy = 0.0;
+  }
+
+  robot_control::MpcController mpc(kHorizon, kDt);
+  robot_control::ControlCmd command_world;
+  ASSERT_TRUE(mpc.solveMPC(state, reference, command_world));
+  EXPECT_NEAR(command_world.vx, 0.4, 1e-6);
+  EXPECT_NEAR(command_world.vy, 0.0, 1e-6);
+
+  // Only the caller converts the solved world command back to /cmd_track's
+  // current chassis frame.
+  const rt::Vector2 command_body = robot_control::tracing::worldVelocityToBody(
+    kYaw, rt::Vector2{command_world.vx, command_world.vy});
+  EXPECT_NEAR(command_body.x, 0.0, 1e-6);
+  EXPECT_NEAR(command_body.y, -0.4, 1e-6);
+}
+
+TEST(TracingPipelineTest, FixedYawRemainsControlledInsideSameMpc)
+{
+  constexpr int kHorizon = 20;
+  constexpr double kDt = 0.05;
+
+  robot_control::State state;
+  state.yaw = 0.20;
+
+  std::vector<robot_control::TrajectoryPoint> reference(kHorizon);
+  for (robot_control::TrajectoryPoint & point : reference) {
+    point.yaw = 0.0;
+    point.vw = 0.0;
+  }
+
+  robot_control::MpcController mpc(kHorizon, kDt);
+  robot_control::ControlCmd command_world;
+  ASSERT_TRUE(mpc.solveMPC(state, reference, command_world));
+
+  EXPECT_NEAR(command_world.vx, 0.0, 1e-6);
+  EXPECT_NEAR(command_world.vy, 0.0, 1e-6);
+  EXPECT_LT(command_world.vw, 0.0);
 }
 
 TEST(MpcControllerTest, ReferenceRelativeSpeedLimitPreventsPositionCatchupOverspeed)

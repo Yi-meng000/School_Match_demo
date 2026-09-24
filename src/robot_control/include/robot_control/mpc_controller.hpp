@@ -14,8 +14,8 @@ namespace robot_control
         double x{0.0};
         double y{0.0};
         double yaw{0.0};
-        double vx{0.0};    // 必须传入底盘真实的纵向速度
-        double vy{0.0};    // 真实的横向速度
+        double vx{0.0};    // 世界系 x 方向实测速度
+        double vy{0.0};    // 世界系 y 方向实测速度
         double vw{0.0};    // 真实的角速度
     };
 
@@ -23,14 +23,14 @@ namespace robot_control
         double x{0.0};
         double y{0.0};
         double yaw{0.0};
-        double vx{0.0};  
-        double vy{0.0};
+        double vx{0.0};   // 世界系 x 方向参考速度
+        double vy{0.0};   // 世界系 y 方向参考速度
         double vw{0.0};
     };
 
     struct ControlCmd {
-        double vx{0.0};  
-        double vy{0.0};
+        double vx{0.0};   // 世界系 x 方向速度指令
+        double vy{0.0};   // 世界系 y 方向速度指令
         double vw{0.0};
     };
 
@@ -40,7 +40,7 @@ namespace robot_control
             // 前 3 项是位姿误差 [ex, ey, eyaw]，后 3 项是速度误差 [vx~, vy~, vw~]。
             // 平动速度误差必须有足够权重，否则优化器会为了追位置窗口而长期超出
             // 速度参考。横向速度同样是全向底盘的平动速度，应当跟随对应参考分量。
-            q_diag_ << 120.0, 120.0, 90.0, 20.0, 20.0, 2.0;
+            q_diag_ << 120.0, 120.0, 90.0, 50.0, 50.0, 2.0;
             r_diag_ << 1.5, 1.5, 0.8;
             max_accel_ << 3.0, 3.0, 4.0;
         }
@@ -99,24 +99,24 @@ namespace robot_control
                 return false;
             }
 
-            // 1. 计算机体坐标系误差 (针对轨迹的第 0 个点)
+            // MPC 的平动位置、速度和速度增量都使用同一世界系。
+            // 坐标转换属于调用层，不在控制器内部进行。
+            // yaw/vw 仍然是同一 MPC 状态和控制量的第三个分量。
+            // 1. 计算世界系位姿误差（针对轨迹的第 0 个点）
             const auto& pt0 = ref_traj[0];
             double dx = pt0.x - current_state.x;
             double dy = pt0.y - current_state.y;
             double dyaw = normalizeAngle(pt0.yaw - current_state.yaw);
 
-            double cos_yaw = std::cos(current_state.yaw);
-            double sin_yaw = std::sin(current_state.yaw);
-
-            Eigen::Vector3d e_body;
-            e_body(0) =  cos_yaw * dx + sin_yaw * dy;
-            e_body(1) = -sin_yaw * dx + cos_yaw * dy;
-            e_body(2) = dyaw;
+            Eigen::Vector3d e_world;
+            e_world(0) = dx;
+            e_world(1) = dy;
+            e_world(2) = dyaw;
 
             // 限幅：路径切换瞬间的误差尖峰不应该直接变成指令尖峰
-            e_body(0) = std::max(-e_max_(0), std::min(e_max_(0), e_body(0)));
-            e_body(1) = std::max(-e_max_(1), std::min(e_max_(1), e_body(1)));
-            e_body(2) = std::max(-e_max_(2), std::min(e_max_(2), e_body(2)));
+            e_world(0) = std::max(-e_max_(0), std::min(e_max_(0), e_world(0)));
+            e_world(1) = std::max(-e_max_(1), std::min(e_max_(1), e_world(1)));
+            e_world(2) = std::max(-e_max_(2), std::min(e_max_(2), e_world(2)));
 
             // [新增闭环] 计算当前真实的初态速度误差 (防止静止起步时命令突跳)
             Eigen::Vector3d current_u_tilde;
@@ -129,13 +129,10 @@ namespace robot_control
             std::vector<Eigen::Matrix<double, 6, 3>> B_tilde_seq(N_);
 
             for (int k = 0; k < N_; ++k) {
-                const auto& pt = ref_traj[k];
-                
+                // 在世界系中，x/y 位置误差只由世界系速度误差积分；
+                // yaw 误差由角速度误差积分。不再把参考车体坐标
+                // 旋转项混入平动误差模型。
                 Eigen::Matrix3d Ad = Eigen::Matrix3d::Identity();
-                Ad(0, 1) =  dt_ * pt.vw;
-                Ad(0, 2) = -dt_ * pt.vy; 
-                Ad(1, 0) = -dt_ * pt.vw;
-                Ad(1, 2) =  dt_ * pt.vx; 
 
                 Eigen::Matrix3d Bd = -dt_ * Eigen::Matrix3d::Identity();
 
@@ -208,7 +205,7 @@ namespace robot_control
             Eigen::MatrixXd H_dense = 2.0 * (Theta.transpose() * Q_big * Theta + R_big);
 
             Eigen::Matrix<double, 6, 1> xi;
-            xi.segment<3>(0) = e_body;
+            xi.segment<3>(0) = e_world;
             xi.segment<3>(3) = current_u_tilde; // 使用真实的初始速度误差
 
             // D 是已知扰动带来的仿射项，只进梯度
@@ -299,7 +296,8 @@ namespace robot_control
             if (!solver.initSolver()) return false;
             if (solver.solveProblem() != OsqpEigen::ErrorExitFlag::NoError) return false;
 
-            // 8. 提取最优解并从实际速度平滑叠加
+            // 8. 提取最优解并从实际速度平滑叠加。平动分量仍是世界系，
+            // 调用者负责在底盘边界将其转换为车体系指令。
             Eigen::VectorXd delta_U_opt = solver.getSolution();
             Eigen::Vector3d delta_u0 = delta_U_opt.segment<3>(0);
 
@@ -319,6 +317,6 @@ namespace robot_control
         bool reference_speed_limit_enabled_{false};
         double reference_speed_margin_{0.0};
         double reference_speed_braking_decel_{1.0};
-        Eigen::Vector3d e_max_{0.30, 0.30, M_PI / 6.0};  // 初态误差限幅 (m, m, rad)
+        Eigen::Vector3d e_max_{1000.0, 1000.0, M_PI};  // 初态误差限幅 (m, m, rad)
     };
 }

@@ -19,6 +19,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ChassisCmd.msg"
   "msg/ControllerCmd.msg"
   "msg/PlanPath.msg"
+  "msg/TrackingDebug.msg"
   "msg/TrackingStatus.msg"
   DEPENDENCIES
     std_msgs

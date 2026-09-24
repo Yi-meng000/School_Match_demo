@@ -74,6 +74,13 @@ struct GeneratorOptions // 在线生成的配置
   double profile_spacing{ 0.02 };            // 速度包络离散使用的弧长间隔 m
   double minimum_speed_for_time{ 1e-4 };     // 时间表除零保护的最小速度 m/s
   double max_reference_lead{ 0.10 };         // 名义速度相位最多领先实测投影的弧长 m
+
+  // These default to true for a library caller. The ROS adapter can turn
+  // them off only for controlled chassis-characterisation tests: the fixed
+  // activation-time v_des(s) is then sent to the MPC without a feedback-driven
+  // curve/end-point braking envelope.
+  bool enforce_curve_speed_limit{ true };
+  bool enforce_dynamic_safety_envelope{ true };
 };
 
 struct PathSample // 某弧长位置的平滑路径位置、单位切线、弧长、曲率
@@ -166,6 +173,16 @@ struct ReferencePoint // 参考轨迹点
   double tangential_acceleration{ 0.0 };
   double curvature{ 0.0 };
   HeadingReference heading;
+
+  // Debug observability for the distinction between the persistent nominal
+  // v_des(s) and the dynamically feasible value sent to the MPC. These do
+  // not participate in trajectory generation.
+  double nominal_phase_arc_length{ 0.0 };
+  double nominal_phase_speed{ 0.0 };
+  double nominal_speed_at_progress{ 0.0 };
+  Vector2 nominal_phase_velocity;
+  bool reachability_limited{ false };
+  bool spatial_safety_limited{ false };
 }; 
 
 // Owns the currently accepted geometry and a persistent nominal speed phase.

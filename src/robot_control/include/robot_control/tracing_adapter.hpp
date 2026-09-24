@@ -29,13 +29,14 @@ inline trajectory::Vector2 bodyVelocityToWorld(
   return rotatePlanarVelocity(yaw, velocity_x_body, velocity_y_body);
 }
 
-// MpcController's velocity reference is expressed in the reference chassis
-// frame.  This is the inverse conversion of bodyVelocityToWorld.
+// Convert a world-frame planar velocity command to the current chassis frame
+// at the ROS/chassis boundary.  MpcController itself remains world-frame-only
+// for planar position, velocity and velocity increments.
 inline trajectory::Vector2 worldVelocityToBody(
-  double reference_yaw, const trajectory::Vector2 & velocity_world)
+  double current_yaw, const trajectory::Vector2 & velocity_world)
 {
-  const double c = std::cos(reference_yaw);
-  const double s = std::sin(reference_yaw);
+  const double c = std::cos(current_yaw);
+  const double s = std::sin(current_yaw);
   return {c * velocity_world.x + s * velocity_world.y,
     -s * velocity_world.x + c * velocity_world.y};
 }

@@ -11,8 +11,10 @@ find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(robot_interfaces REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OsqpEigen REQUIRED)
+find_package(navigation QUIET)
 # uncomment the following section in order to fill in
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
@@ -32,7 +34,15 @@ target_include_directories(tracing_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-ament_target_dependencies(tracing_node rclcpp geometry_msgs robot_interfaces nav_msgs)
+ament_target_dependencies(tracing_node rclcpp geometry_msgs robot_interfaces nav_msgs std_msgs)
+if(navigation_FOUND)
+  ament_target_dependencies(tracing_node navigation)
+  target_compile_definitions(tracing_node PRIVATE ROBOT_CONTROL_HAS_PLAN_META=1)
+else()
+  message(WARNING
+    "navigation/msg/PlanMeta is unavailable: tracing_node will not accept /plan "
+    "until the navigation package is in the ROS environment and robot_control is rebuilt")
+endif()
 target_link_libraries(tracing_node
   translational_trajectory
   Eigen3::Eigen
@@ -54,6 +64,10 @@ install(TARGETS translational_trajectory
 
 install(DIRECTORY include/
   DESTINATION include/
+)
+
+install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME}
 )
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)

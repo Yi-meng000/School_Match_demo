@@ -183,6 +183,55 @@ TEST(TrajectoryGeneratorTest, PersistentNominalPhaseEscapesStationaryStartup)
   }
 }
 
+TEST(TrajectoryGeneratorTest, ReportsNominalSpeedSeparatelyFromReachabilityLimit)
+{
+  const rt::PathGeometry path = buildPath({{0.0, 0.0}, {4.0, 0.0}});
+  rt::TrajectoryGenerator generator(limits());
+  std::string error;
+  ASSERT_TRUE(generator.activatePath(path, stoppedState(), &error)) << error;
+
+  // Simulate a sudden state mismatch: the stored nominal schedule still starts
+  // from zero, while the one-step reference must be able to brake from 1 m/s.
+  const rt::MotionState2D unexpectedly_fast{{0.0, 0.0}, {1.0, 0.0}};
+  std::vector<rt::ReferencePoint> reference;
+  ASSERT_EQ(
+    generator.makeHorizon(unexpectedly_fast, 0.02, 1, &reference),
+    rt::TrajectoryStatus::Ready);
+  ASSERT_EQ(reference.size(), 1u);
+
+  const rt::ReferencePoint & point = reference.front();
+  EXPECT_NEAR(point.nominal_speed_at_progress, 0.0, 1e-8);
+  EXPECT_GT(point.nominal_phase_speed, 0.0);
+  EXPECT_TRUE(point.reachability_limited);
+  EXPECT_GT(point.speed, 0.90);
+  EXPECT_GT(point.speed, point.nominal_phase_speed);
+}
+
+TEST(TrajectoryGeneratorTest, CharacterisationModeKeepsNominalReferenceWithoutEmergencyStop)
+{
+  const rt::PathGeometry path = buildPath({{0.0, 0.0}, {2.0, 0.0}});
+  rt::GeneratorOptions options;
+  options.enforce_curve_speed_limit = false;
+  options.enforce_dynamic_safety_envelope = false;
+  rt::TrajectoryGenerator generator(limits(), options);
+  std::string error;
+  ASSERT_TRUE(generator.activatePath(path, stoppedState(), &error)) << error;
+
+  // This state cannot stop before the nominal zero-speed endpoint under the
+  // configured emergency limit. Test mode reports the distance deficit but
+  // leaves the fixed nominal reference available to the MPC.
+  const rt::MotionState2D late_and_fast{{1.95, 0.0}, {5.0, 0.0}};
+  std::vector<rt::ReferencePoint> reference;
+  EXPECT_EQ(
+    generator.makeHorizon(late_and_fast, 0.02, 1, &reference),
+    rt::TrajectoryStatus::Ready);
+  ASSERT_EQ(reference.size(), 1u);
+  EXPECT_GT(generator.diagnostics().stop_deficit, 0.0);
+  EXPECT_FALSE(reference.front().reachability_limited);
+  EXPECT_FALSE(reference.front().spatial_safety_limited);
+  EXPECT_NEAR(reference.front().speed, reference.front().nominal_phase_speed, 1e-9);
+}
+
 TEST(TrajectoryGeneratorTest, OverspeedAboveCruiseBrakesWithoutFalseEmergencyStop)
 {
   const rt::PathGeometry path = buildPath({{0.0, 0.0}, {2.0, 0.0}});
@@ -265,6 +314,36 @@ TEST(TrajectoryGeneratorTest, CurvatureCapLimitsSpeed)
     }
   }
   EXPECT_TRUE(observed_curve);
+}
+
+TEST(TrajectoryGeneratorTest, CharacterisationModeCanBypassCurvatureCap)
+{
+  rt::PathBuildOptions options = pathOptions();
+  options.smooth_half_window = 0.12;
+  options.max_smooth_deviation = 0.20;
+  const rt::PathGeometry path =
+    buildPath({{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}, {2.0, 1.0}}, options);
+  rt::GeneratorOptions generator_options;
+  generator_options.enforce_curve_speed_limit = false;
+  generator_options.enforce_dynamic_safety_envelope = false;
+  rt::TrajectoryGenerator generator(limits(), generator_options);
+  std::string error;
+  ASSERT_TRUE(generator.activatePath(path, stoppedState(), &error)) << error;
+
+  std::vector<rt::ReferencePoint> reference;
+  ASSERT_EQ(
+    generator.makeHorizon(stoppedState(), 0.02, 700, &reference),
+    rt::TrajectoryStatus::Ready);
+
+  bool exceeded_normal_curve_cap = false;
+  for (const rt::ReferencePoint & point : reference) {
+    const double curvature = std::fabs(point.curvature);
+    if (curvature > 0.10) {
+      const double normal_curve_cap = std::sqrt(limits().max_lateral_accel / curvature);
+      exceeded_normal_curve_cap = exceeded_normal_curve_cap || point.speed > normal_curve_cap + 0.05;
+    }
+  }
+  EXPECT_TRUE(exceeded_normal_curve_cap);
 }
 
 TEST(TrajectoryGeneratorTest, RecedingHorizonKeepsCurvatureAccelerationBounded)

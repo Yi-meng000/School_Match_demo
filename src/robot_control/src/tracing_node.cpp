@@ -8,6 +8,7 @@
  * Outputs:
  *   /cmd_track        geometry_msgs/Twist in the chassis frame
  *   /tracking_status  current lifecycle and safety state
+ *   /tracking_debug   temporary nominal/reference/command/feedback telemetry
  *
  * `map` and `odom` are deliberately treated as numerically identical in this
  * first deployment.  Do not use this adapter with a drifting map->odom
@@ -19,8 +20,14 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "nav_msgs/msg/path.hpp"
+#include "std_msgs/msg/header.hpp"
 #include "robot_interfaces/msg/controller_cmd.hpp"
+#include "robot_interfaces/msg/tracking_debug.hpp"
 #include "robot_interfaces/msg/tracking_status.hpp"
+
+#ifdef ROBOT_CONTROL_HAS_PLAN_META
+#include "navigation/msg/plan_meta.hpp"
+#endif
 
 #include "robot_control/mpc_controller.hpp"
 #include "robot_control/tracing_adapter.hpp"
@@ -70,6 +77,15 @@ public:
     sub_plan_ = create_subscription<nav_msgs::msg::Path>(
       plan_topic_, plan_qos,
       std::bind(&TracingNode::planCallback, this, std::placeholders::_1));
+#ifdef ROBOT_CONTROL_HAS_PLAN_META
+    sub_plan_meta_ = create_subscription<navigation::msg::PlanMeta>(
+      plan_meta_topic_, plan_qos,
+      std::bind(&TracingNode::planMetaCallback, this, std::placeholders::_1));
+#else
+    RCLCPP_WARN(
+      get_logger(),
+      "navigation/msg/PlanMeta is not available in this build; /plan will wait for a PlanMeta-capable rebuild");
+#endif
     sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
       odom_topic_, rclcpp::QoS(1).best_effort(),
       std::bind(&TracingNode::odomCallback, this, std::placeholders::_1));
@@ -83,6 +99,8 @@ public:
     status_qos.reliable().transient_local();
     pub_status_ = create_publisher<robot_interfaces::msg::TrackingStatus>(
       status_topic_, status_qos);
+    pub_debug_ = create_publisher<robot_interfaces::msg::TrackingDebug>(
+      debug_topic_, rclcpp::QoS(10).reliable());
 
     timer_ = create_wall_timer(
       std::chrono::duration<double>(dt_),
@@ -91,8 +109,13 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "tracing_node: N=%d dt=%.3f, /plan=%s /odom=%s /cmd_track=%s; "
+      "curve_speed_limit=%s dynamic_safety_envelope=%s; "
+      "MPC delta limits=(%.1f, %.1f) m/s^2, %.1f rad/s^2; "
       "map and odom are configured as numerically identical; odom yaw offset=%.3f rad (%.1f deg)",
       N_, dt_, plan_topic_.c_str(), odom_topic_.c_str(), cmd_track_topic_.c_str(),
+      generator_options_.enforce_curve_speed_limit ? "on" : "off",
+      generator_options_.enforce_dynamic_safety_envelope ? "on" : "off",
+      normal_mpc_accel_.x(), normal_mpc_accel_.y(), normal_mpc_accel_.z(),
       odom_yaw_offset_, odom_yaw_offset_ * 180.0 / kPi);
   }
 
@@ -105,18 +128,23 @@ private:
       throw std::invalid_argument("N must be positive and dt must be positive");
     }
 
-    motion_limits_.cruise_speed = declare_parameter<double>("cruise_speed", 0.6); // 巡航速度
-    motion_limits_.max_accel = declare_parameter<double>("max_accel", 2.0);
-    motion_limits_.normal_decel = declare_parameter<double>("normal_decel", 2.0);
-    motion_limits_.emergency_decel = declare_parameter<double>("emergency_decel", 3.0);
+    motion_limits_.cruise_speed = declare_parameter<double>("cruise_speed", 1.8); // 巡航速度
+    // Temporary high-performance test profile.  These remain ROS parameters
+    // so the validated vehicle limits can replace them without recompiling.
+    motion_limits_.max_accel = declare_parameter<double>("max_accel", 4.0);
+    motion_limits_.normal_decel = declare_parameter<double>("normal_decel", 4.0);
+    // MotionLimits requires emergency_decel >= normal_decel.  Keep the
+    // minimum valid value until a separately calibrated emergency value is
+    // supplied through the parameter.
+    motion_limits_.emergency_decel = declare_parameter<double>("emergency_decel", 6.0);
     motion_limits_.max_lateral_accel = declare_parameter<double>("max_lateral_accel", 3.0);
     motion_limits_.terminal_speed = declare_parameter<double>("terminal_speed", 0.0);
     motion_limits_.accel_fraction = declare_parameter<double>("accel_fraction", 0.20);  // 加速段占比
     motion_limits_.decel_fraction = declare_parameter<double>("decel_fraction", 0.25);  // 减速段占比
 
-    path_options_.sample_spacing = declare_parameter<double>("sample_spacing", 0.02);
-    path_options_.rdp_epsilon = declare_parameter<double>("rdp_epsilon", 0.03);
-    path_options_.smooth_half_window = declare_parameter<double>("smooth_half_window", 0.15);
+    path_options_.sample_spacing = declare_parameter<double>("sample_spacing", 0.05);  // 采样距离
+    path_options_.rdp_epsilon = declare_parameter<double>("rdp_epsilon", 0.0);  // rdp抽稀容差
+    path_options_.smooth_half_window = declare_parameter<double>("smooth_half_window", 0.0);  // 平滑窗口半窗大小
     path_options_.max_smooth_deviation = declare_parameter<double>("max_smooth_deviation", 0.05);
     path_options_.max_smoothing_attempts =
       declare_parameter<int>("max_smoothing_attempts", 5);
@@ -132,6 +160,13 @@ private:
       declare_parameter<double>("minimum_speed_for_time", 1e-4);
     generator_options_.max_reference_lead =
       declare_parameter<double>("max_reference_lead", 0.10);
+    // Experimental defaults: characterise the chassis against the fixed
+    // v_des(s) first. Restore both to true after the lidar velocity and
+    // vehicle limits are calibrated.
+    generator_options_.enforce_curve_speed_limit =
+      declare_parameter<bool>("enforce_curve_speed_limit", false);
+    generator_options_.enforce_dynamic_safety_envelope =
+      declare_parameter<bool>("enforce_dynamic_safety_envelope", false);
 
     q_diag_ << declare_parameter<double>("q_ex", 120.0),
       declare_parameter<double>("q_ey", 120.0),
@@ -143,12 +178,16 @@ private:
       declare_parameter<double>("r_du_y", 1.5),
       declare_parameter<double>("r_du_w", 0.8);
 
-    normal_mpc_accel_ << declare_parameter<double>("a_max_x", 2.0),
-      declare_parameter<double>("a_max_y", 3.0),
-      declare_parameter<double>("a_max_w", 4.0);
+    // Temporary tracking experiment: at dt=0.05 s these high limits allow
+    // a 5 m/s change in each planar axis and a 5 rad/s change in yaw rate
+    // in one step. The reference-relative planar speed cap remains active.
+    // Restore measured chassis limits after characterisation.
+    normal_mpc_accel_ << declare_parameter<double>("a_max_x", 100.0),
+      declare_parameter<double>("a_max_y", 100.0),
+      declare_parameter<double>("a_max_w", 100.0);
     emergency_mpc_accel_ <<
-      declare_parameter<double>("emergency_a_max_x", motion_limits_.emergency_decel),
-      declare_parameter<double>("emergency_a_max_y", motion_limits_.emergency_decel),
+      declare_parameter<double>("emergency_a_max_x", normal_mpc_accel_.x()),
+      declare_parameter<double>("emergency_a_max_y", normal_mpc_accel_.y()),
       declare_parameter<double>("emergency_a_max_w", normal_mpc_accel_(2));
 
     reference_speed_margin_ = declare_parameter<double>("reference_speed_margin", 0.05);
@@ -161,8 +200,8 @@ private:
               "reference_speed_margin must be non-negative and reference_speed_braking_decel must be positive");
     }
 
-    e_xy_max_ = declare_parameter<double>("e_xy_max", 0.30);
-    e_yaw_max_ = declare_parameter<double>("e_yaw_max", 0.5236);
+    e_xy_max_ = declare_parameter<double>("e_xy_max", 1000.0);
+    e_yaw_max_ = declare_parameter<double>("e_yaw_max", kPi);
     goal_position_tolerance_ = declare_parameter<double>("goal_position_tolerance", 0.05);
     goal_speed_tolerance_ = declare_parameter<double>("goal_speed_tolerance", 0.05);
     odom_timeout_ = declare_parameter<double>("odom_timeout", 0.30);
@@ -174,10 +213,12 @@ private:
     odom_yaw_offset_ = declare_parameter<double>("odom_yaw_offset", 0.0);
 
     plan_topic_ = declare_parameter<std::string>("plan_topic", "plan");
+    plan_meta_topic_ = declare_parameter<std::string>("plan_meta_topic", "/terrain_minco/plan_meta");
     odom_topic_ = declare_parameter<std::string>("odom_topic", "OdometryHighFreq");
     controller_topic_ = declare_parameter<std::string>("controller_topic", "cmd_controller");
     cmd_track_topic_ = declare_parameter<std::string>("cmd_track_topic", "cmd_track");
     status_topic_ = declare_parameter<std::string>("status_topic", "tracking_status");
+    debug_topic_ = declare_parameter<std::string>("debug_topic", "tracking_debug");
     path_frame_ = declare_parameter<std::string>("path_frame", "map");
     odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link_hf");
@@ -195,38 +236,104 @@ private:
 
   void planCallback(const nav_msgs::msg::Path::SharedPtr msg)
   {
-    // Temporary single-path test mode: after the first usable path is cached,
-    // ignore every later message.  The planner currently publishes at 2 Hz
-    // without a path_id, so treating them as replans would perturb a fixed-path
-    // tracking test.  Restart tracing_node to select another test path.
-    if (have_cached_path_) {
-      last_valid_plan_t_ = now();
-      RCLCPP_DEBUG_THROTTLE(
+    // /plan deliberately remains a standard nav_msgs/Path. Its paired
+    // navigation/PlanMeta has an identical header and supplies path_id.
+#ifdef ROBOT_CONTROL_HAS_PLAN_META
+    pending_plan_ = msg;
+    tryAcceptPendingPlan();
+#else
+    (void)msg;
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "received /plan but this tracing_node was built without navigation/msg/PlanMeta");
+#endif
+  }
+
+#ifdef ROBOT_CONTROL_HAS_PLAN_META
+  static bool sameHeader(const std_msgs::msg::Header & lhs, const std_msgs::msg::Header & rhs)
+  {
+    return lhs.stamp.sec == rhs.stamp.sec && lhs.stamp.nanosec == rhs.stamp.nanosec &&
+           lhs.frame_id == rhs.frame_id;
+  }
+
+  static bool headerIsOlder(const std_msgs::msg::Header & lhs, const std_msgs::msg::Header & rhs)
+  {
+    return lhs.stamp.sec < rhs.stamp.sec ||
+           (lhs.stamp.sec == rhs.stamp.sec && lhs.stamp.nanosec < rhs.stamp.nanosec);
+  }
+
+  void planMetaCallback(const navigation::msg::PlanMeta::SharedPtr msg)
+  {
+    pending_plan_meta_ = msg;
+    tryAcceptPendingPlan();
+  }
+
+  void tryAcceptPendingPlan()
+  {
+    if (!pending_plan_ || !pending_plan_meta_) {
+      return;
+    }
+
+    if (!sameHeader(pending_plan_->header, pending_plan_meta_->header)) {
+      // The two topics have independent DDS delivery order. Drop only the
+      // older unmatched item, so a following counterpart can still form a pair.
+      if (headerIsOlder(pending_plan_->header, pending_plan_meta_->header)) {
+        pending_plan_.reset();
+      } else {
+        pending_plan_meta_.reset();
+      }
+      RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 1000,
-        "ignoring nav_msgs/Path: single-path test mode already has a cached path");
+        "discarded an unmatched /plan or /terrain_minco/plan_meta header while waiting for a pair");
       return;
     }
 
-    if (!validPlanFrame(msg->header.frame_id)) {
+    const uint64_t path_id = pending_plan_meta_->path_id;
+    const nav_msgs::msg::Path::SharedPtr path = std::move(pending_plan_);
+    pending_plan_meta_.reset();
+
+    if (have_seen_path_id_ && path_id <= latest_path_id_) {
+      if (path_id == latest_path_id_) {
+        // publish_seq and path_start_s intentionally do not affect trajectory
+        // state. A same-ID pair is only a heartbeat for plan_timeout.
+        last_valid_plan_t_ = now();
+        RCLCPP_DEBUG_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "ignoring duplicate path_id=%lu", static_cast<unsigned long>(path_id));
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "ignoring stale path_id=%lu; latest seen path_id=%lu",
+          static_cast<unsigned long>(path_id), static_cast<unsigned long>(latest_path_id_));
+      }
+      return;
+    }
+
+    have_seen_path_id_ = true;
+    latest_path_id_ = path_id;
+    acceptPlan(*path, path_id);
+  }
+#endif
+
+  void acceptPlan(const nav_msgs::msg::Path & msg, uint64_t path_id)
+  {
+    if (!validPlanFrame(msg.header.frame_id)) {
       rejectPath(
-        "Plan frame '" + msg->header.frame_id + "' does not match expected '" + path_frame_ + "'");
+        "path_id=" + std::to_string(path_id) + ": plan frame '" + msg.header.frame_id +
+        "' does not match expected '" + path_frame_ + "'");
       return;
     }
-
-    // Temporary planner interface: nav_msgs/Path has no path_id.  The first
-    // valid message is used as the fixed test path.  When the planner switches
-    // to PlanPath, restore same-ID heartbeat filtering and new-ID replanning.
 
     std::vector<rt::Point2> points;
-    points.reserve(msg->poses.size());
-    for (const auto & pose : msg->poses) {
+    points.reserve(msg.poses.size());
+    for (const auto & pose : msg.poses) {
       points.push_back({pose.pose.position.x, pose.pose.position.y});
     }
 
     rt::PathGeometry candidate;
     std::string error;
     if (!candidate.build(points, path_options_, &error)) {
-      rejectPath("Cannot build path: " + error);
+      rejectPath("path_id=" + std::to_string(path_id) + ": cannot build path: " + error);
       return;
     }
 
@@ -238,8 +345,8 @@ private:
     path_activation_rejected_ = false;
 
     RCLCPP_INFO(
-      get_logger(), "received nav_msgs/Path: %zu samples, %.3f m, max smooth deviation %.4f m",
-      cached_path_.size(), cached_path_.length(),
+      get_logger(), "accepted path_id=%lu: %zu samples, %.3f m, max smooth deviation %.4f m",
+      static_cast<unsigned long>(path_id), cached_path_.size(), cached_path_.length(),
       cached_path_.maxSmoothDeviation());
 
     if (tracking_enabled_) {
@@ -282,8 +389,13 @@ private:
     // remains available only for an explicitly known legacy frame alignment.
     const rt::Vector2 chassis_velocity = robot_control::tracing::rotatePlanarVelocity(
       -odom_yaw_offset_, msg->twist.twist.linear.x, msg->twist.twist.linear.y);
-    mpc_state_.vx = chassis_velocity.x;
-    mpc_state_.vy = chassis_velocity.y;
+    // The odometry twist is reported in child_frame_id.  Convert it here, at
+    // the ROS boundary, so every planar quantity passed to MpcController is in
+    // the same world frame as the path and trajectory reference.
+    const rt::Vector2 world_velocity = robot_control::tracing::bodyVelocityToWorld(
+      mpc_state_.yaw, chassis_velocity.x, chassis_velocity.y);
+    mpc_state_.vx = world_velocity.x;
+    mpc_state_.vy = world_velocity.y;
     mpc_state_.vw = msg->twist.twist.angular.z;
 
     RCLCPP_INFO_ONCE(
@@ -295,8 +407,7 @@ private:
       -odom_yaw_offset_, -odom_yaw_offset_ * 180.0 / kPi);
 
     motion_state_.position = {mpc_state_.x, mpc_state_.y};
-    motion_state_.velocity = robot_control::tracing::bodyVelocityToWorld(
-      mpc_state_.yaw, mpc_state_.vx, mpc_state_.vy);
+    motion_state_.velocity = world_velocity;
     have_odom_ = true;
 
     if (tracking_enabled_ && have_cached_path_ && !generator_->hasActivePath() && !goal_reached_ &&
@@ -511,14 +622,12 @@ private:
     mpc_reference.reserve(reference.size());
     for (const rt::ReferencePoint & point : reference) {
       const double reference_yaw = point.heading.valid ? point.heading.yaw : locked_yaw_;
-      const rt::Vector2 velocity_body = robot_control::tracing::worldVelocityToBody(
-        reference_yaw, point.velocity);
       robot_control::TrajectoryPoint mpc_point;
       mpc_point.x = point.position.x;
       mpc_point.y = point.position.y;
       mpc_point.yaw = reference_yaw;
-      mpc_point.vx = velocity_body.x;
-      mpc_point.vy = velocity_body.y;
+      mpc_point.vx = point.velocity.x;
+      mpc_point.vy = point.velocity.y;
       mpc_point.vw = point.heading.valid ? point.heading.angular_velocity : 0.0;
       mpc_reference.push_back(mpc_point);
     }
@@ -539,11 +648,17 @@ private:
       return;
     }
 
+    // MpcController returns a world-frame planar command.  /cmd_track is a
+    // chassis-frame interface, so perform the only output conversion here
+    // using the current measured yaw (not the locked/reference yaw).
+    const rt::Vector2 command_body = robot_control::tracing::worldVelocityToBody(
+      mpc_state_.yaw, rt::Vector2{command.vx, command.vy});
     geometry_msgs::msg::Twist output;
-    output.linear.x = command.vx;
-    output.linear.y = command.vy;
+    output.linear.x = command_body.x;
+    output.linear.y = command_body.y;
     output.angular.z = command.vw;
     pub_cmd_track_->publish(output);
+    publishDebug(reference.front(), trajectory_status, command);
 
     if (trajectory_status == rt::TrajectoryStatus::EmergencyBraking) {
       publishStatus(
@@ -569,9 +684,7 @@ private:
     status.header.stamp = now();
     status.header.frame_id = path_frame_;
     status.has_path = have_cached_path_;
-    // nav_msgs/Path has no path_id.  Keep the existing status message ABI, but
-    // report 0 until the planner migrates to robot_interfaces/PlanPath.
-    status.path_id = 0U;
+    status.path_id = have_seen_path_id_ ? latest_path_id_ : 0U;
     status.state = state;
     status.progress = diagnostics_.progress;
     status.remaining_distance = diagnostics_.remaining_length;
@@ -579,6 +692,41 @@ private:
     status.terminal_speed = diagnostics_.terminal_speed_if_unstoppable;
     status.detail = detail;
     pub_status_->publish(status);
+  }
+
+  void publishDebug(
+    const rt::ReferencePoint & point,
+    const rt::TrajectoryStatus trajectory_status,
+    const robot_control::ControlCmd & command)
+  {
+    robot_interfaces::msg::TrackingDebug debug;
+    debug.header.stamp = now();
+    // Keep all planar debug vectors in the same world frame used by MPC so a
+    // bag can compare reference, feedback and optimizer output directly.
+    debug.header.frame_id = path_frame_;
+    debug.trajectory_status = static_cast<uint8_t>(trajectory_status);
+    debug.progress = diagnostics_.progress;
+    debug.remaining_distance = diagnostics_.remaining_length;
+    debug.nominal_phase_arc_length = point.nominal_phase_arc_length;
+    debug.nominal_phase_speed = point.nominal_phase_speed;
+    debug.nominal_speed_at_progress = point.nominal_speed_at_progress;
+    debug.reference_arc_length = point.arc_length;
+    debug.reference_speed = point.speed;
+    debug.reachability_limited = point.reachability_limited;
+    debug.spatial_safety_limited = point.spatial_safety_limited;
+    debug.nominal_reference.linear.x = point.nominal_phase_velocity.x;
+    debug.nominal_reference.linear.y = point.nominal_phase_velocity.y;
+    debug.nominal_reference.angular.z = point.heading.valid ? point.heading.angular_velocity : 0.0;
+    debug.final_reference.linear.x = point.velocity.x;
+    debug.final_reference.linear.y = point.velocity.y;
+    debug.final_reference.angular.z = point.heading.valid ? point.heading.angular_velocity : 0.0;
+    debug.command.linear.x = command.vx;
+    debug.command.linear.y = command.vy;
+    debug.command.angular.z = command.vw;
+    debug.measured.linear.x = mpc_state_.vx;
+    debug.measured.linear.y = mpc_state_.vy;
+    debug.measured.angular.z = mpc_state_.vw;
+    pub_debug_->publish(debug);
   }
 
   int N_{20};
@@ -592,9 +740,9 @@ private:
   Eigen::Vector3d normal_mpc_accel_{};
   Eigen::Vector3d emergency_mpc_accel_{};
   double reference_speed_margin_{0.05};
-  double reference_speed_braking_decel_{2.0};
-  double e_xy_max_{0.30};
-  double e_yaw_max_{0.5236};
+  double reference_speed_braking_decel_{4.0};
+  double e_xy_max_{1000.0};
+  double e_yaw_max_{kPi};
   double goal_position_tolerance_{0.05};
   double goal_speed_tolerance_{0.05};
   double odom_timeout_{0.30};
@@ -602,10 +750,12 @@ private:
   double odom_yaw_offset_{0.0};
 
   std::string plan_topic_;
+  std::string plan_meta_topic_;
   std::string odom_topic_;
   std::string controller_topic_;
   std::string cmd_track_topic_;
   std::string status_topic_;
+  std::string debug_topic_;
   std::string path_frame_;
   std::string odom_frame_;
   std::string base_frame_;
@@ -620,19 +770,27 @@ private:
   bool tracking_enabled_{false};
   bool have_odom_{false};
   bool have_cached_path_{false};
+  bool have_seen_path_id_{false};
   bool have_locked_yaw_{false};
   bool goal_reached_{false};
   bool emergency_stop_{false};
   bool path_activation_rejected_{false};
   double locked_yaw_{0.0};
+  uint64_t latest_path_id_{0U};
   std::string last_odom_error_;
 
   rclcpp::Time last_odom_t_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_valid_plan_t_{0, 0, RCL_ROS_TIME};
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_track_;
+  rclcpp::Publisher<robot_interfaces::msg::TrackingDebug>::SharedPtr pub_debug_;
   rclcpp::Publisher<robot_interfaces::msg::TrackingStatus>::SharedPtr pub_status_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr sub_plan_;
+#ifdef ROBOT_CONTROL_HAS_PLAN_META
+  rclcpp::Subscription<navigation::msg::PlanMeta>::SharedPtr sub_plan_meta_;
+  nav_msgs::msg::Path::SharedPtr pending_plan_;
+  navigation::msg::PlanMeta::SharedPtr pending_plan_meta_;
+#endif
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
   rclcpp::Subscription<robot_interfaces::msg::ControllerCmd>::SharedPtr sub_controller_;
   rclcpp::TimerBase::SharedPtr timer_;

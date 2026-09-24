@@ -25,7 +25,7 @@
     cached_path_ --------------+
                                |
     /OdometryHighFreq ---------+--> MotionState2D(世界系位置、世界系速度)
-          |                    |    State(MPC 用的位置、机体系速度)
+          |                    |    State(MPC 用的世界系位置、世界系速度)
           v                    |
     tracing_node::odomCallback |
                                v
@@ -35,11 +35,13 @@
                         |      返回 N 个 ReferencePoint：
                         |      世界系 x/y, vx/vy, ax/ay, s, 曲率
                         |
-                        +--> worldVelocityToBody(锁定 yaw, 世界速度)
-                        |
                         +--> MpcController::solveMPC
                         |
+                        +--> worldVelocityToBody(当前实测 yaw, 世界指令)
+                        |
                         +--> /cmd_track : Twist（底盘机体系 vx/vy/vw）
+                        |
+                        +--> /tracking_debug : 名义参考、最终参考、MPC 指令、里程计速度
 
 本节点目前的一个明确前提是：map 与 odom 的数值完全重合。它不是 TF 变换，也没有查询 map 到 odom 的坐标变换。路径位置按 map 数字使用，里程计位置按 odom 数字使用，直接认为两者是同一世界坐标。若以后 map 相对 odom 会漂移，必须先接入 tf2，不能仅修改 frame_id 字符串。
 
@@ -48,9 +50,10 @@
 | 名称 | 所在坐标系 | 用途 |
 | --- | --- | --- |
 | motion_state_.velocity | 世界系 | 给平动轨迹库投影、计算路径切线速度。 |
-| mpc_state_.vx / vy | 底盘机体系 | MPC 当前实测速度。 |
+| mpc_state_.vx / vy | 世界系 | MPC 当前实测速度。 |
 | ReferencePoint.velocity | 世界系 | 路径切线乘以标量速度。 |
-| TrajectoryPoint.vx / vy | 参考车体系 | 送给现有 MPC 的速度参考。 |
+| TrajectoryPoint.vx / vy | 世界系 | 送给 MPC 的速度参考。 |
+| ControlCmd.vx / vy | 世界系 | MPC 求解出的平动指令。 |
 | /cmd_track.linear.x / y | 底盘机体系 | MPC 的输出，尚由 commmux_node 以后的工作接管。 |
 
 两个旋转公式都在 tracing_adapter.hpp：
@@ -73,12 +76,13 @@ tracing_node，不需要单独的 cpp 文件。
 | 函数 | 每一句的作用 |
 | --- | --- |
 | bodyVelocityToWorld(yaw, vx_body, vy_body) | L17--18 分别算 cos/sin；L19--20 乘标准二维旋转矩阵 R(yaw)，把 Odometry.twist 的机体系线速度变为轨迹库使用的世界系线速度。 |
-| worldVelocityToBody(reference_yaw, velocity_world) | L28--29 算 cos/sin；L30--31 乘 R(yaw) 的转置，即逆旋转，把轨迹库世界速度转成 MpcController 参考速度所用的参考车体系。 |
+| worldVelocityToBody(current_yaw, velocity_world) | L28--29 算 cos/sin；L30--31 乘 R(yaw) 的转置，即逆旋转，把 MPC 的世界系平动指令转成 `/cmd_track` 需要的当前车体系。 |
 | yawFromQuaternion(x,y,z,w) | L36--38 用平面 yaw 的 atan2 公式从四元数取得绕 z 的偏航角。它不归一化四元数；输入 Odometry 应提供规范化姿态。 |
 
-这两个速度函数互为逆变换的前提是两次使用同一个 yaw。当前实现中，实测
-速度使用当前 mpc_state_.yaw 转世界系，而参考速度使用 locked_yaw_ 转参考车体系；
-这是有意的：前者描述“车现在实际怎么运动”，后者描述“固定朝向下 MPC 应怎样平移”。
+这两个速度函数都只在 `tracing_node` 的系统边界使用：输入边界按当前
+`mpc_state_.yaw` 把 Odometry twist 转为世界系，输出边界用同一当前 yaw
+把 MPC 世界系指令转回底盘车体系。锁定的 `locked_yaw_` 只是 yaw 参考，
+不用于平动速度坐标变换。
 
 ## 2. tracing_node 的完整生命周期
 
@@ -138,7 +142,7 @@ controlTick()（L345--508）每个周期按下列优先级检查。上面的条�
        因开关还没开，只发 DISABLED，不激活 generator_。
 
     2. /OdometryHighFreq 到达
-       odomCallback 缓存当前位置、yaw、机体系速度和世界系速度。
+       odomCallback 缓存当前位置、yaw，并把机体系 twist 转为 MPC 与轨迹库共用的世界系速度。
        若开关未开，到这里仍不运动。
 
     3. /cmd_controller.trajectory 从 0 变为非零
@@ -149,8 +153,8 @@ controlTick()（L345--508）每个周期按下列优先级检查。上面的条�
     4. 每个 dt 周期
        controlTick 调用 makeHorizon(state, dt, N)。
        轨迹库从实测世界系速度和当前位置重建未来 N 点的速度包络。
-       节点把每个世界速度旋转成固定 yaw 下的机体系速度。
-       MPC 输出一个机体系 ControlCmd，节点发布为 /cmd_track。
+       节点把世界系位置、速度及锁定 yaw 原样交给 MPC。
+       MPC 输出世界系平动 ControlCmd，节点按当前实测 yaw 转为车体系后发布 /cmd_track。
 
     5. 靠近路径终点
        剩余弧长 <= 0.05 m，且实测世界平动速度 <= 0.05 m/s。
@@ -164,24 +168,27 @@ controlTick()（L345--508）每个周期按下列优先级检查。上面的条�
 
 | 源码位置 | 话题与类型 | QoS | 回调中的职责 |
 | --- | --- | --- | --- |
-| L60--66 | plan_topic_，nav_msgs/Path | reliable、volatile、深度 1 | 单路径测试时仅缓存第一条成功构建的几何路径。volatile 兼容普通 Path 发布者；节点晚启动后必须等规划器再发一帧。 |
+| 构造函数 | plan_topic_，nav_msgs/Path | reliable、volatile、深度 1 | 提供路径点列；只在与同 header 的 PlanMeta 配对后处理。 |
+| 构造函数 | plan_meta_topic_，navigation/PlanMeta | reliable、volatile、深度 1 | 只读取 uint64 path_id；其余字段全部忽略。 |
 | L65--67 | odom_topic_，nav_msgs/Odometry | best_effort、深度 1 | 提供高频实测状态。丢旧包比排队旧包更安全。 |
 | L68--70 | controller_topic_，ControllerCmd | reliable、深度 10 | 只读取 trajectory 字段作为开关。 |
 | L72--73 | cmd_track_topic_，geometry_msgs/Twist | reliable、深度 1 | 发布底盘机体系速度。 |
 | L74--77 | status_topic_，TrackingStatus | reliable、transient_local、深度 1 | 发布最近一份状态，便于诊断节点晚加入后立即读到。 |
+| controlTick 求解成功后 | debug_topic_，TrackingDebug | reliable、volatile、深度 10 | 临时测试话题：同一条消息并列记录名义 `v_des(s)`、最终参考、MPC 指令和反馈速度。 |
 
 当前临时输入 nav_msgs/Path 的字段用途：
 
 | 字段 | 是否使用 | 具体用途 |
 | --- | --- | --- |
 | header.frame_id | 使用 | 必须严格等于 path_frame_，默认 map。 |
-| header.stamp | 未使用 | 不参与过期判断；过期判断使用本节点收到消息的 now()。 |
+| header.stamp | 使用 | 与 PlanMeta 的 stamp、frame_id 一起作为同一帧路径的配对键。 |
 | poses[].pose.position.x/y | 使用 | 唯一的几何输入。 |
 | poses[].pose.orientation | 未使用 | 平动库和第一版固定 yaw 都不读路径点姿态。 |
 
-临时约定：nav_msgs/Path 没有 path_id，节点处于单路径测试模式：第一条成功构建的 Path
-被锁存，后续 2 Hz 消息直接忽略，不会重建或重置 progress_。要测试不同路径需重启节点。
-等升级到 robot_interfaces/PlanPath 后，才恢复“相同 ID 只保活、不重置进度”的逻辑。
+`navigation/PlanMeta` 与对应 Path 的 header 必须完全相同。节点只读取其中的 `path_id`：
+相同 ID 视为保活、不会重建或重置 progress_；较旧 ID 丢弃；较新 ID 才构建候选几何并切换。
+`publish_seq`、`replanned`、`path_start_s` 和 `reason` 都不参与寻迹。PlanMeta 是外部包消息，
+必须在编译 tracing_node 的 ROS 环境中可用。
 
 ### 3.2 declareParameters（L91--158）
 
@@ -191,11 +198,13 @@ controlTick()（L345--508）每个周期按下列优先级检查。上面的条�
 | --- | ---: | --- |
 | N_ / N | 20 | 一个 MPC 窗口与一个轨迹窗口的点数。 |
 | dt_ / dt | 0.05 s | timer 周期、参考点间隔、MPC 离散周期。 |
-| motion_limits_.cruise_speed | 1.2 m/s | 直线无约束时的速度上限。 |
-| max_accel | 2.0 m/s2 | 轨迹库正向可达速度及正常 MPC 限制的相关设置。 |
-| normal_decel | 2.0 m/s2 | 正常制动包络和是否进入紧急制动。 |
-| emergency_decel | 3.0 m/s2 | 仅正常制动不够时可使用的更高减速度；必须上车标定。 |
-| max_lateral_accel | 3.0 m/s2 | 根据曲率产生的弯道速度上限。 |
+| motion_limits_.cruise_speed | 1.8 m/s | 直线无约束时的速度上限。 |
+| max_accel | 4.0 m/s2 | 临时高性能测试的正向加速上限；轨迹库与正常 MPC 限制同步。 |
+| normal_decel | 4.0 m/s2 | 临时高性能测试的正常制动包络。 |
+| emergency_decel | 6.0 m/s2 | 必须不低于 normal_decel；临时测试值，待单独标定后替换。 |
+| max_lateral_accel | 3.0 m/s2 | 根据曲率产生的弯道速度上限；当前节点测试模式默认不启用该速度帽。 |
+| enforce_curve_speed_limit | false | 测试模式下不让曲率降低固定名义 `v_des(s)`；恢复标定后的安全策略时设为 true。 |
+| enforce_dynamic_safety_envelope | false | 测试模式下不根据最新里程计速度触发弯前/终点 `Emergency*` 停机；终点的名义正弦减速仍保留。 |
 | terminal_speed | 0 m/s | 默认路径末端停车。 |
 | accel_fraction / decel_fraction | 0.20 / 0.25 | 无局部限速时正弦加/减速段的目标距离比例，硬约束优先。 |
 | sample_spacing | 0.02 m | 几何路径等弧长采样间隔。 |
@@ -208,15 +217,17 @@ controlTick()（L345--508）每个周期按下列优先级检查。上面的条�
 | profile_spacing | 0.02 m | 速度包络弧长离散间隔。 |
 | minimum_speed_for_time | 1e-4 m/s | 从速度积分时间时的除零保护。 |
 | max_reference_lead | 0.10 m | 名义速度相位相对实测进度的最大弧长超前量。 |
-| q_diag_ | 120,120,90,2,0.5,2 | MPC 六维状态误差权重。 |
+| q_diag_ | 120,120,90,20,20,2 | MPC 六维状态误差权重；平动速度项提高，避免位置追赶压过速度跟踪。 |
 | r_diag_ | 1.5,1.5,0.8 | MPC 三个速度增量的惩罚。 |
-| normal_mpc_accel_ | 2,3,4 | 正常状态下 vx、vy、vw 速度增量限值。 |
-| emergency_mpc_accel_ | 3,3,4 | EmergencyBraking 时替换 MPC 的 vx、vy、vw 限值。 |
-| e_xy_max_ / e_yaw_max_ | 0.30 m / 0.5236 rad | 新路径切换时，送进 MPC 前的位置/yaw 误差饱和幅度。 |
+| normal_mpc_accel_ | 100,100,100 | 测试模式下 vx、vy、vw 的单步速度增量界；平动和角速度界均已放宽。 |
+| emergency_mpc_accel_ | 100,100,100 | EmergencyBraking 时使用的单步增量界，默认跟随正常值。 |
+| reference_speed_margin | 0.05 m/s | 每个预测点允许比该点参考平动速度多出的纠偏余量；速度上限仍随参考减速到零。 |
+| reference_speed_braking_decel | normal_decel | 当前实测速度高于参考相关上限时，速度上限每步按此减速度可达地收紧；EmergencyBraking 自动用 emergency_decel。 |
+| e_xy_max_ / e_yaw_max_ | 1000 m / π rad | 初始位置/yaw 误差饱和幅度；当前测试范围内默认基本不截断位置误差，yaw 误差归一化到 ±π。 |
 | goal_position_tolerance_ / goal_speed_tolerance_ | 0.05 m / 0.05 m/s | GOAL_REACHED 的双条件阈值。 |
 | odom_timeout_ | 0.30 s | 最后里程计超过此时长便停车。 |
 | plan_timeout_ | 0 s | 0 表示不要求规划器周期保活；临时 nav_msgs/Path 接口应保持 0，等 path_id 接口恢复后才适合正数保活。 |
-| odom_yaw_offset_ | -1.57079632679 rad | 临时补偿雷达 child frame 相对实际车头的 +90 度固定偏差；同一偏置的反向旋转也用于把 twist 转进真实车体系。雷达端修正后设为 0。 |
+| odom_yaw_offset_ | 0 rad | 雷达现已输出真实底盘 yaw 与 twist，默认不做旋转。该参数只保留给明确已知的旧版/第三方里程计帧偏置，当前雷达不得再设为 -90 度。 |
 | *_topic_ | 见源码 L150--154 | 允许 launch 文件改话题名。 |
 | path_frame_ / odom_frame_ / base_frame_ | map / odom / base_link_hf | 严格检查输入坐标系标识。 |
 
@@ -290,8 +301,8 @@ validOdomFrames 同时检查两项：
 | 行 | 做的事 | 为什么 |
 | --- | --- | --- |
 | L225--235 | frame 不合法：置 have_odom_=false，记录文本，清空激活轨迹并立即发零。 | 不在坐标语义不明时控制车辆。 |
-| L238--246 | 记录当前时间；把 pose 写入 x/y/yaw；将 raw twist 旋转到物理车体系后写入 MPC 的 vx/vy/vw。 | MPC 期待当前速度在底盘系，不能混入雷达 child frame 的分量。 |
-| L242--250 | quaternion 经 yawFromQuaternion 取原始平面偏航角，再加 odom_yaw_offset 并归一化；raw twist 同时乘 R(-odom_yaw_offset)。 | 当前默认 yaw 减 90 度，twist 则加 90 度：`vx_chassis=-vy_raw, vy_chassis=vx_raw`，两者共同使车头沿世界 +x 时的姿态与速度语义一致。 |
+| L238--246 | 记录当前时间；把 pose 写入 x/y/yaw；将 raw twist 先对齐到物理车体系，再按当前 yaw 转世界系后写入 MPC 的 vx/vy。 | MPC 和轨迹库共用世界系平动速度；vw 仍是绕 z 轴角速度。 |
+| L242--250 | quaternion 经 yawFromQuaternion 取原始平面偏航角，再加 odom_yaw_offset 并归一化；raw twist 同时乘 R(-odom_yaw_offset)。 | 当前默认 offset 为 0，故 yaw 与 twist 直接使用。非零 offset 仅用于明确已知的兼容性帧变换，不能为当前已修正雷达重新设置 -90 度。 |
 | L252--254 | 位置直接复用；已校正的机体系线速度用当前 yaw 旋转到世界系。 | 轨迹库依靠速度在路径切线上的投影来确定初速度。 |
 | L251 | 置 have_odom_=true。 | 允许 controlTick 进入下一阶段。 |
 | L253--260 | 若已开、已有路径、还未激活、且没有终点/急停/拒绝锁存，尝试激活。 | 支持开关和路径均早到、里程计最后到的顺序。 |
@@ -346,10 +357,10 @@ L347 把 now() 复制到 current_time，保证本周期的两个超时判断使�
 | L428--440 | EmergencyInfeasible | 锁存 emergency_stop_，绕过 MPC，直接发零；外部安全层需要据此采取急停。 |
 | L442--450 | 轨迹库无激活路径或 N 点不足 | 零命令、PATH_REJECTED；不能拿不完整窗口求 MPC。 |
 | L452--461 | 剩余弧长与实测速度都进阈值 | 锁存目标完成，清路径，零命令。 |
-| L463--477 | 逐点适配给 MPC | 世界位置原样传；世界速度旋转到固定参考 yaw 下的车体系；角速度目前为 0。 |
+| L463--477 | 逐点适配给 MPC | 世界位置和世界速度原样传；yaw 是锁定的出发角，角速度目前为 0。 |
 | L479--481 | 根据轨迹状态设置 MPC 加速度限制 | 紧急制动参考配紧急增量限值，防止 MPC 自己仍只允许正常制动。 |
 | L483--489 | 求解失败 | 零命令、MPC_FAILURE。 |
-| L491--495 | 求解成功 | 直接把 command.vx/vy/vw 写进 Twist 并发布。 |
+| L491--495 | 求解成功 | 按当前实测 yaw 把世界系 command.vx/vy 转成车体系，vw 原样写进 Twist 并发布。 |
 | L497--507 | 正常或紧急状态发布 | EmergencyBraking 有特殊状态和 warn；否则 TRACKING。 |
 
 HeadingProvider 的 lambda（L420--422）忽略时间和弧长，始终返回有效的 locked_yaw_、零角速度、零角加速度。库因此不会自行派生 yaw；它只是把这个外部 yaw 值透传到每个 ReferencePoint。
@@ -1045,32 +1056,33 @@ makeHorizon 依次完成：
       9. 输出 t=0.05,0.10,...,1.00 的 x/y/vx/vy/ax/ay。
 
     tracing_node：
-      对每一点，以 locked_yaw 把 v_world 转到 MPC 所用参考车体系；
-      x/y 保持世界系；
+      x/y 和 vx/vy 都保持世界系；
       yaw 始终是 locked_yaw，vw=0；
       将 20 点交给 MPC。
 
     MPC：
-      基于实测车体系 vx/vy/vw 与参考窗口求下一个小速度增量；
-      tracing_node 发布求得的底盘系 vx/vy/vw。
+      基于实测世界系 vx/vy、实测 vw 与参考窗口求下一个小速度增量；
+      同时将每个预测平动指令限制在“该点参考速度模长 + 小余量”的内接八边形内；
+      tracing_node 把世界系 vx/vy 按当前 yaw 转到车体系，再与 vw 一起发布。
 
 这里保存的是名义速度相位，不是累计位置参考。MPC 仍用实际状态和第一未来参考点的误差求控制；第一参考位置每周期只从实测投影向前积分一个 dt，因此车辆暂时不动时不会让位置误差无限增长。
 
 ## 11. 关键安全语义与当前实现边界
 
-### 11.1 当前临时接口：只锁存一条路径
+### 11.1 当前接口：`Path` 几何与 `PlanMeta` 路径代次
 
-PathGeometry 和 TrajectoryGenerator 不认识 ROS 消息；路径代次只应由 ROS 适配层管理。
-当前规划器仍发布 nav_msgs/Path 且会以 2 Hz 重发，因此 tracing_node 处于单路径测试模式：
+PathGeometry 和 TrajectoryGenerator 不认识 ROS 消息；路径代次只由 ROS 适配层管理。
+规划器继续在 `/plan` 发布标准 `nav_msgs/Path`，并在 `/terrain_minco/plan_meta` 发布
+`navigation/PlanMeta`。两个消息 header 完全相同才组成一帧输入：
 
-- 第一条通过 frame 与 build 检查的 Path 被缓存；
-- 已启用时，它从当前实测位置投影并开始跟踪；
-- 之后所有 Path 都不再检查 frame、不再 build、不再改变 progress_ 或终点状态；
-- 想换测试路径必须重启 tracing_node；
-- TrackingStatus.path_id 为固定的 0，表示“该输入接口没有路径代次”。
+- 只读取 `PlanMeta.path_id`，并原样以 `uint64` 写入 `TrackingStatus.path_id`；
+- 相同 ID 只更新保活接收时间，不 build、不切换、不改变 progress_；
+- 较旧 ID 丢弃，防止跨 topic 延迟交付把旧路径覆盖新路径；
+- 更大 ID 才 build 候选几何；通过后，启用状态从当前实测位置投影并切换；
+- `publish_seq`、`replanned`、`path_start_s` 和 `reason` 均不读取。
 
-后续规划器切换到 robot_interfaces/PlanPath 时，应恢复以下规则：相同 ID 是保活，
-新 ID 才重建；几何变化必须伴随 ID 递增。
+`navigation` 是规划侧提供的外部 ROS 包。缺少该消息 type support 时，tracing_node 仍可编译，
+但会拒绝所有没有 PlanMeta 的 `/plan`；将该包加入 ROS 环境后重新构建即可启用订阅。
 
 ### 11.2 “正常、紧急、急停”不是同一件事
 
@@ -1151,8 +1163,8 @@ PathGeometry 和 TrajectoryGenerator 不认识 ROS 消息；路径代次只应�
 真实 ROS 节点还需要负责：
 
 1. 将 Odometry 机体系 vx/vy 转到 state.velocity 的世界系；
-2. 把 ReferencePoint.velocity 从世界系转到现有 MPC 期待的参考车体系；
+2. 将 ReferencePoint.velocity 作为世界系参考原样传给 MPC；
 3. 根据 TrajectoryStatus 选择正常/紧急 MPC 限制或安全停机；
-4. 将 MPC 输出按底盘约定发布。
+4. 将 MPC 世界系平动输出按当前实测 yaw 转为车体系后，再按底盘约定发布。
 
 这也正是 tracing_node 的职责边界。

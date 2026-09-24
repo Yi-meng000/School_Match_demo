@@ -847,28 +847,31 @@ bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state, boo
     return shape;
   }();
 
-  for (std::size_t i = 0; i < node_count; ++i)
+  if (options_.enforce_curve_speed_limit)
   {
-    const PathSample path_sample = path_.sample(arc_lengths[i]);
-    const double curvature = std::fabs(path_sample.curvature);
-    if (curvature > 1e-8)
+    for (std::size_t i = 0; i < node_count; ++i)
     {
-      curve_caps[i] = std::min(curve_caps[i], std::sqrt(limits_.max_lateral_accel / curvature));
+      const PathSample path_sample = path_.sample(arc_lengths[i]);
+      const double curvature = std::fabs(path_sample.curvature);
+      if (curvature > 1e-8)
+      {
+        curve_caps[i] = std::min(curve_caps[i], std::sqrt(limits_.max_lateral_accel / curvature));
+      }
     }
-  }
-  // Cap both ends of each profile segment by that segment's maximum curvature.
-  // This is deliberately conservative over one small segment, but guarantees
-  // interpolated time samples cannot exceed the lateral-acceleration limit.
-  for (std::size_t i = 0; i + 1 < node_count; ++i)
-  {
-    const double curvature_a = std::fabs(path_.sample(arc_lengths[i]).curvature);
-    const double curvature_b = std::fabs(path_.sample(arc_lengths[i + 1]).curvature);
-    const double max_curvature = std::max(curvature_a, curvature_b);
-    if (max_curvature > 1e-8)
+    // Cap both ends of each profile segment by that segment's maximum curvature.
+    // This is deliberately conservative over one small segment, but guarantees
+    // interpolated time samples cannot exceed the lateral-acceleration limit.
+    for (std::size_t i = 0; i + 1 < node_count; ++i)
     {
-      const double segment_cap = std::sqrt(limits_.max_lateral_accel / max_curvature);
-      curve_caps[i] = std::min(curve_caps[i], segment_cap);
-      curve_caps[i + 1] = std::min(curve_caps[i + 1], segment_cap);
+      const double curvature_a = std::fabs(path_.sample(arc_lengths[i]).curvature);
+      const double curvature_b = std::fabs(path_.sample(arc_lengths[i + 1]).curvature);
+      const double max_curvature = std::max(curvature_a, curvature_b);
+      if (max_curvature > 1e-8)
+      {
+        const double segment_cap = std::sqrt(limits_.max_lateral_accel / max_curvature);
+        curve_caps[i] = std::min(curve_caps[i], segment_cap);
+        curve_caps[i + 1] = std::min(curve_caps[i + 1], segment_cap);
+      }
     }
   }
 
@@ -1217,6 +1220,14 @@ TrajectoryStatus TrajectoryGenerator::makeHorizon(const MotionState2D& current_s
   {
     return diagnostics_.status;
   }
+  // Characterisation mode deliberately keeps the activation-time v_des(s)
+  // independent of the newest velocity feedback. Keep stop-distance values
+  // in diagnostics, but never escalate them to an autonomous zero command.
+  if (!options_.enforce_dynamic_safety_envelope)
+  {
+    diagnostics_.status = TrajectoryStatus::Ready;
+    diagnostics_.terminal_speed_if_unstoppable = 0.0;
+  }
   if (reference_profile_.empty())
   {
     diagnostics_.status = TrajectoryStatus::NoActivePath;
@@ -1234,6 +1245,11 @@ TrajectoryStatus TrajectoryGenerator::makeHorizon(const MotionState2D& current_s
   const double proposed_reference_time = std::max(reference_time_ + dt, synchronized_time);
   reference_time_ = std::min(reference_duration,
                              std::max(reference_time_, std::min(proposed_reference_time, allowed_reference_time)));
+  // This is the persistent, activation-time nominal speed v_des(s) at the
+  // vehicle's current projected path position. It remains observable even if
+  // a later safety envelope has to alter the final reference.
+  const ReferencePoint nominal_at_progress = sampleProfile(
+      reference_profile_, reference_exact_nominal_, synchronized_time);
 
   out->reserve(steps);
   const PathSample measured_path_sample = path_.sample(progress_);
@@ -1248,29 +1264,40 @@ TrajectoryStatus TrajectoryGenerator::makeHorizon(const MotionState2D& current_s
     const ReferencePoint nominal = sampleProfile(
         reference_profile_, reference_exact_nominal_, profile_time);
 
-    const double lower_speed = std::max(0.0, previous_speed - deceleration * dt);
-    const double upper_speed = previous_speed + limits_.max_accel * dt;
-    double speed = clamp(nominal.speed, lower_speed, upper_speed);
-
-    // Couple the persistent nominal phase to the spatial safety envelope. Two
-    // passes are sufficient because the candidate distance changes only one
-    // control step and profile_spacing is small.
-    double next_arc = reference_arc;
-    for (int pass = 0; pass < 2; ++pass)
+    double speed = nominal.speed;
+    bool reachability_limited = false;
+    double next_arc = nominal.arc_length;
+    bool spatial_safety_limited = false;
+    if (options_.enforce_dynamic_safety_envelope)
     {
+      const double lower_speed = std::max(0.0, previous_speed - deceleration * dt);
+      const double upper_speed = previous_speed + limits_.max_accel * dt;
+      speed = clamp(nominal.speed, lower_speed, upper_speed);
+      reachability_limited = std::fabs(speed - nominal.speed) > 1e-8;
+
+      // Couple the persistent nominal phase to the spatial safety envelope. Two
+      // passes are sufficient because the candidate distance changes only one
+      // control step and profile_spacing is small.
+      next_arc = reference_arc;
+      for (int pass = 0; pass < 2; ++pass)
+      {
+        next_arc = std::min(path_.length(), reference_arc + 0.5 * (previous_speed + speed) * dt);
+        // Leave a small numerical margin so projection/tangent interpolation on
+        // the next control tick cannot place the measured speed microscopically
+        // above the backward braking envelope and falsely report infeasibility.
+        const double spatial_cap =
+            std::max(0.0, profileSpeedAtArcLength(profile_, next_arc) - 1e-4);
+        spatial_safety_limited = spatial_safety_limited || speed > spatial_cap + 1e-8;
+        speed = std::max(lower_speed, std::min(speed, spatial_cap));
+      }
       next_arc = std::min(path_.length(), reference_arc + 0.5 * (previous_speed + speed) * dt);
-      // Leave a small numerical margin so projection/tangent interpolation on
-      // the next control tick cannot place the measured speed microscopically
-      // above the backward braking envelope and falsely report infeasibility.
-      const double spatial_cap =
-          std::max(0.0, profileSpeedAtArcLength(profile_, next_arc) - 1e-4);
-      speed = std::max(lower_speed, std::min(speed, spatial_cap));
     }
-    next_arc = std::min(path_.length(), reference_arc + 0.5 * (previous_speed + speed) * dt);
 
     const PathSample path_sample = path_.sample(next_arc);
     const Vector2 normal{ -path_sample.tangent.y, path_sample.tangent.x };
-    const double tangential_acceleration = (speed - previous_speed) / dt;
+    const double tangential_acceleration = options_.enforce_dynamic_safety_envelope ?
+                                          (speed - previous_speed) / dt :
+                                          nominal.tangential_acceleration;
     ReferencePoint point;
     point.time_from_now = time_from_now;
     point.arc_length = next_arc;
@@ -1282,6 +1309,12 @@ TrajectoryStatus TrajectoryGenerator::makeHorizon(const MotionState2D& current_s
     point.acceleration = add(
         scale(path_sample.tangent, tangential_acceleration),
         scale(normal, path_sample.curvature * speed * speed));
+    point.nominal_phase_arc_length = nominal.arc_length;
+    point.nominal_phase_speed = nominal.speed;
+    point.nominal_speed_at_progress = nominal_at_progress.speed;
+    point.nominal_phase_velocity = nominal.velocity;
+    point.reachability_limited = reachability_limited;
+    point.spatial_safety_limited = spatial_safety_limited;
     if (heading_provider)
     {
       point.heading = heading_provider(time_from_now, point.arc_length);

@@ -1,4 +1,4 @@
-# 校内赛上位机代码demo
+# mpc轨迹追踪代码demo
 
 ## USB2TTL 设备芯片信息
 /*
@@ -42,6 +42,25 @@ KERNEL=="ttyACM*", ATTRS{serial}=="BC48272EABCD8F43", MODE:="0777", SYMLINK+="tt
 蓝牙
 KERNEL=="ttyACM*", ATTRS{serial}=="BC48271FABCD8F34", MODE:="0777", SYMLINK+="tty_bluetooth"
 */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

@@ -12,7 +12,7 @@
 | 组成 | 文件 | 职责 |
 | --- | --- | --- |
 | 平动库 | include/robot_control/translational_trajectory.hpp、src/translational_trajectory.cpp | 世界系平动路径、速度包络、曲率限速和紧急制动诊断。 |
-| ROS 适配 | src/tracing_node.cpp | 当前临时接收 nav_msgs/Path；订阅 Odometry、遥控器寻迹开关，完成固定 yaw、MPC 参考和状态话题。 |
+| ROS 适配 | src/tracing_node.cpp | 配对接收标准 nav_msgs/Path 与 navigation/PlanMeta 的 path_id；订阅 Odometry、遥控器寻迹开关，完成固定 yaw、MPC 参考和状态话题。 |
 | 坐标辅助 | include/robot_control/tracing_adapter.hpp | 世界系/机体系速度旋转及四元数 yaw 提取。 |
 
 新库输出世界坐标系的 vx、vy、ax、ay；MpcController 的速度误差状态则使用机体系
@@ -60,6 +60,52 @@ x, y, vx, vy, ax, ay, 可选 yaw、omega、alpha
 ~~~
 
 该库不读取 CSV，不订阅 ROS 话题，不查询障碍物地图，不进行轮组运动学分配，也不产生 yaw 轨迹。这些工作放在调用方或后续适配层。
+
+### 临时速度对比话题
+
+为验证实车是否真的在跟随路径速度剖面，`tracing_node` 额外发布了临时诊断话题
+`/tracking_debug`（`robot_interfaces/TrackingDebug`，reliable、volatile、深度 10）。它只用于
+录包和调参，不参与任何控制决策。
+
+每个成功求解 MPC 的控制周期发布一条消息。该话题的
+`header.frame_id=map`，所有平动 `Twist.linear` 均在世界系，便于直接对比：
+
+- `nominal_speed_at_progress`：固定名义剖面在实测进度处的 `v_des(s)`；
+- `nominal_phase_*` / `nominal_reference`：本周期名义相位对应的速度与弧长；
+- `reference_*` / `final_reference`：经过当前可达性与空间安全包络后，真正送给 MPC 的第一项参考；
+- `reachability_limited`：因实测速度到名义速度在一个 dt 内不可达而发生夹紧；
+- `spatial_safety_limited`：因曲率或终点制动安全包络而发生夹紧；
+- `command`：MPC 输出的世界系平动指令；节点随后按当前实测 yaw
+  转成车体系后才发布 `/cmd_track`；
+- `measured`：已从 Odometry child frame 转到世界系、真正送进 MPC 的最新速度。
+
+建议下一次测试同时录制：
+
+~~~bash
+ros2 bag record /tracking_debug /cmd_track /OdometryHighFreq /tracking_status /plan /cmd_controller
+~~~
+
+当两个 `*_limited` 都为 false 时，`reference_speed` 应接近名义剖面的速度；若二者频繁为
+true，再分别判断是加速度/减速度参数过保守，还是实测速度已经偏离名义状态。
+
+当前 `tracing_node` 默认使用临时测试参数：`max_accel=4.0 m/s²`、
+`normal_decel=4.0 m/s²`、`emergency_decel=6.0 m/s²`。为检查减速跟踪，
+正常和紧急 MPC 的平动单步增量界默认提高到 `100.0 m/s²`，在 `dt=0.05 s`
+时相当于每轴每拍 `5.0 m/s`，对当前 `1.8 m/s` 测试近似不限制。
+`a_max_w` 和 `emergency_a_max_w` 也默认 `100.0 rad/s²`，每拍最多改变 `5.0 rad/s`；参考相关的平动速度上界仍生效。
+恢复原界时，将 `a_max_x/y` 设为 `4.0`、`emergency_a_max_x/y` 设为 `6.0`，`a_max_w` 和 `emergency_a_max_w` 设为 `4.0`。节点测试模式默认
+`enforce_curve_speed_limit=false`、`enforce_dynamic_safety_envelope=false`：MPC 接收固定
+名义 `v_des(s)`，不会因实时里程计反馈触发弯前或终点 `Emergency*` 零命令。终点的名义
+正弦减速段、里程计超时、人工关闭寻迹、MPC 参考相关速度上界及 yaw 误差归一化仍然保留。
+
+纯 C++ 库的两个开关仍默认开启；这是 `tracing_node` 为底盘能力与雷达速度反馈测试所选的
+临时默认值。完成测试后，用下列参数恢复完整安全包络：
+
+~~~bash
+ros2 run robot_control tracing_node --ros-args \
+  -p enforce_curve_speed_limit:=true \
+  -p enforce_dynamic_safety_envelope:=true
+~~~
 
 ---
 
@@ -135,6 +181,8 @@ MotionLimits::isValid 会检查：
 | profile_spacing | 0.02 m | 速度包络离散使用的弧长间隔。 |
 | minimum_speed_for_time | 1e-4 m/s | 时间表除零保护的最小速度。 |
 | max_reference_lead | 0.10 m | 名义速度相位相对实测投影允许的最大弧长超前量；超过后暂停相位推进。 |
+| enforce_curve_speed_limit | true | 是否按 `v_curve(s)` 限制激活时的名义剖面。纯库默认开启。 |
+| enforce_dynamic_safety_envelope | true | 是否根据每周期实测速度重建可达性、弯前制动和终点制动包络；关闭后输出固定名义 `v_des(s)`，不产生 `Emergency*` 停机。纯库默认开启。 |
 
 ### 3.5 yaw 扩展接口 HeadingProvider
 
@@ -393,7 +441,8 @@ N = (-T_y, T_x)
 名义时间并非无限前跑：它最多比实测投影超前 `max_reference_lead`。同时，每个输出窗口的
 位置都从最新实测投影重新积分，第一参考位置只前进一个控制步，不会累计形成永久位置偏置。
 每周期仍会从实测位置和速度重建一份独立安全包络，用于曲率限速、加速度可达性、终点制动
-以及正常/紧急状态判断。最终参考同时满足持续名义相位和当前安全包络，MPC 本身未因此修改。
+以及正常/紧急状态判断。最终参考同时满足持续名义相位和当前安全包络；MPC 还会将每一步
+输出速度约束在该参考速度附近，避免仅为追位置窗口而持续超速。
 
 ---
 
@@ -499,7 +548,8 @@ generator.makeHorizon(state, 0.05, 20, &horizon, heading_provider);
 
 | Topic | 类型 | QoS/坐标约定 | 用途 |
 | --- | --- | --- | --- |
-| `plan` | `nav_msgs/Path`（单路径测试） | reliable + volatile，depth 1；必须是 `map` | 仅缓存第一条成功构建的路径，后续消息忽略。 |
+| `plan` | `nav_msgs/Path` | reliable + volatile，depth 1；必须是 `map` | 仅提供路径几何；必须与同 header 的 `plan_meta` 配对。 |
+| `/terrain_minco/plan_meta` | `navigation/PlanMeta` | reliable + volatile，depth 1；header 必须与对应 `plan` 完全相同 | 仅读取 `uint64 path_id`；同 ID 不重置，较旧 ID 丢弃，较新 ID 才重建并切换路径。`publish_seq`、`replanned`、`path_start_s`、`reason` 不参与寻迹。 |
 | `OdometryHighFreq` | `nav_msgs/Odometry` | best-effort，depth 1；pose=`odom`，twist=`base_link_hf` | 实测位姿和机体系速度。 |
 | `cmd_controller` | `robot_interfaces/ControllerCmd` | reliable | 只使用 `trajectory` 字段作寻迹开关。 |
 | `cmd_track` | `geometry_msgs/Twist` | reliable，机体系 | MPC 输出；本轮尚未由 commmux 转发到底盘。 |
@@ -509,36 +559,64 @@ generator.makeHorizon(state, 0.05, 20, &horizon, heading_provider);
 不是 `map` 的路径，以及不是 `odom` / `base_link_hf` 的里程计。若以后地图定位引入
 真实的 `map->odom` 漂移，必须改用 tf2 统一坐标系后才能继续使用。
 
-当前雷达里程计还存在固定的 child frame 定义偏差：车头沿世界系 `+x` 时，四元数给出的
-yaw 约为 `+90 deg`。节点临时通过参数 `odom_yaw_offset=-1.57079632679 rad` 将原始 yaw
-减去 90 度，并将 raw twist 乘 `R(-odom_yaw_offset)` 后再作为 MPC 速度反馈。当前值下即
-`vx_chassis=-vy_raw, vy_chassis=vx_raw`。雷达端修正坐标定义后，必须把该参数设回 `0.0`，
-避免重复校正。
+雷达里程计现已将四元数 yaw 与 child-frame twist 修正为真实底盘约定。节点默认
+`odom_yaw_offset=0.0`：原始 yaw 直接使用，`raw twist` 先按当前 yaw 转为
+MPC 所用的世界系速度。
+该参数保留仅用于明确已知的旧版或第三方里程计帧偏置；不得再为当前雷达设置 `-90 deg`，
+否则会再次引入重复旋转。
 
 新库只接受世界系状态。Odometry 的 raw twist 先转换到物理车体系，再转换到世界系：
 
 ~~~
-v_chassis = R(-odom_yaw_offset) * v_raw
+v_chassis = v_raw  # 默认 odom_yaw_offset = 0
 vx_world = cos(yaw)*vx_chassis - sin(yaw)*vy_chassis
 vy_world = sin(yaw)*vx_chassis + cos(yaw)*vy_chassis
 ~~~
 
-固定 yaw 的参考速度需反向转进 MPC 的参考机体系：
+MPC 的位置、平动速度、速度误差和平动速度增量全部在世界系中。
+轨迹库的世界系参考速度不再转到锁定 yaw 坐标系。MPC 求解后，
+`tracing_node` 只在 `/cmd_track` 边界按“当前实测 yaw”转为底盘车体系：
 
 ~~~
-vx_ref_body = cos(yaw_ref)*vx_world + sin(yaw_ref)*vy_world
-vy_ref_body = -sin(yaw_ref)*vx_world + cos(yaw_ref)*vy_world
+vx_cmd_body = cos(yaw_actual)*vx_cmd_world + sin(yaw_actual)*vy_cmd_world
+vy_cmd_body = -sin(yaw_actual)*vx_cmd_world + cos(yaw_actual)*vy_cmd_world
 ~~~
+
+### MPC 的参考相关速度上限
+
+速度参考既是 MPC 代价函数中的跟踪目标，也是输出的硬安全边界。对预测窗口第 `k` 点，节点
+将平动指令限制为：
+
+~~~
+v_target[k] = norm([vx_ref[k], vy_ref[k]]) + reference_speed_margin
+v_reachable[k] = max(0, norm([vx_measured, vy_measured]) - a_brake * (k + 1) * dt)
+v_limit[k] = max(v_target[k], v_reachable[k])
+norm([vx_cmd[k], vy_cmd[k]]) <= v_limit[k]  # 内接八边形实现可能更紧
+~~~
+
+默认 `reference_speed_margin=0.05 m/s`，只留给位置纠偏很小的余量；因此参考进入减速段或
+终点零速时，MPC 上限也会同步降低。若当前实测速度已经高于该上限，
+`reference_speed_braking_decel`（默认 `normal_decel`）使每个未来点的上限按可实现制动能力
+逐步下降，避免把 QP 强行变成“当前拍必须瞬停”的不可行问题。紧急制动状态自动改用
+`emergency_decel`。可达项只是放宽速度上界，并不强制指令按该斜率制动。
+
+该圆形速度上限在 QP 中由内接八边形实现，故无论蟹行方向如何都不会越过设定的速度模长；
+八边形在边中方向的实际速度上限为 `v_limit * cos(π/8)`，可能比参考速度还低。
+例如参考 `1.8 m/s`、余量 `0.05 m/s` 且实测未超速时，该方向仅允许约 `1.71 m/s`。
+它与每拍 `a_max_x/y` 增量界同时生效；当前节点测试默认值为 `100.0 m/s²`，
+使平动增量界在 `1.8 m/s` 测试范围内基本不生效。`q_vx`、`q_vy` 默认均为 `20`，提高速度跟踪
+在代价函数中的优先级，但硬上限不依赖权重，不能只靠调权重替代。
 
 开关关闭时生成器清空并持续发布零 `cmd_track`，但缓存最后一条合法路径；开关上升沿锁住
-当前 yaw，并从当前位置向该缓存路径重新投影。当前临时接口是单路径测试模式：只接受第一条
-成功构建的 `nav_msgs/Path`，后续 2 Hz 消息全部忽略，因此固定目标的重复路径不会影响进度。
-要测试另一条路径需重启 `tracing_node`。
+当前 yaw，并从当前位置向该缓存路径重新投影。每个 `/plan` 必须与 `/terrain_minco/plan_meta`
+的 `header.stamp` 和 `header.frame_id` 完全一致才会被处理。相同 `path_id` 只更新可选的
+`plan_timeout` 保活，不重建也不改变 `progress_`；较旧 ID 会丢弃；更大的 ID 才构建候选几何，
+并在启用状态下从当前实测位置切换。
 
-默认 `plan_timeout=0`，适合单路径测试。等规划器升级到 PlanPath 后，节点会恢复“同一 ID
-只保活、不重置进度”的处理；此时规划器即使仍以 2 Hz 重发也没有问题。
-临时订阅使用 volatile durability 以兼容普通 nav_msgs/Path 发布者，因此节点晚于规划器启动时，
-规划器需要再发布一帧。里程计超时始终生效，默认 `0.30 s`。
+默认 `plan_timeout=0`，不要求规划器周期重发。订阅使用 volatile durability 以兼容普通
+nav_msgs/Path 发布者，因此节点晚于规划器启动时，规划器需要再发布一对匹配的消息。里程计
+超时始终生效，默认 `0.30 s`。构建此适配功能时 ROS 环境必须提供 `navigation/msg/PlanMeta`；
+本地缺少该包时，节点会明确拒绝没有 path_id 的 `/plan`，而不会退回旧的首帧锁存逻辑。
 
 寻迹暂不使用 ROS Action：遥控器开关承担启停，当前 `nav_msgs/Path` 是任务内的重规划更新，
 `TrackingStatus` 提供进度和结果。以后需要行为树、抢占和客户端等待结果时，再在
@@ -569,10 +647,10 @@ vy_ref_body = -sin(yaw_ref)*vx_world + cos(yaw_ref)*vy_world
 
 | 文件 | 职责 |
 | --- | --- |
-| include/robot_control/mpc_controller.hpp | 基于 Eigen 与 OsqpEigen 的 MPC/QP；构建未来 N 步时变预测模型、限制速度增量，并允许寻迹节点在紧急制动时同步切换增量上限。 |
-| include/robot_control/tracing_adapter.hpp | 无 ROS 依赖的坐标辅助：机体系到世界系、世界系到参考机体系、四元数到平面 yaw，以及固定偏置后的 yaw 归一化。 |
+| include/robot_control/mpc_controller.hpp | 基于 Eigen 与 OsqpEigen 的 MPC/QP；世界系平动与 yaw 在同一 MPC 中优化，同时约束速度增量与参考相关的平动速度模长；紧急制动时同步切换增量和速度上限的制动斜率。控制器内部不做坐标转换。 |
+| include/robot_control/tracing_adapter.hpp | 无 ROS 依赖的坐标边界辅助：Odometry 机体系速度到世界系、MPC 世界系指令到当前车体系、四元数到平面 yaw，以及固定偏置后的 yaw 归一化。 |
 | test/tracing_adapter_test.cpp | 验证上述坐标适配和固定 yaw 偏置归一化。 |
-| test/tracing_pipeline_test.cpp | 不修改 MPC 实现，串联持续相位轨迹窗口与现有 MPC，验证静止起步时 vx 命令不再停留在正弦第一拍。 |
+| test/tracing_pipeline_test.cpp | 串联持续相位轨迹窗口与 MPC；验证静止起步连续性，以及即使位置误差很大也不能超出参考相关速度上限。 |
 
 ### ROS 节点
 
@@ -600,9 +678,9 @@ source /opt/ros/humble/setup.bash
 ctest --output-on-failure -R '^(translational_trajectory_test|tracing_adapter_test|tracing_pipeline_test)$'
 ~~~
 
-当前结果：轨迹库的 12 个 GTest、坐标适配的 4 个 GTest 和 1 个轨迹到现有 MPC 的管线测试
-全部通过。测试包含静止起步连续调用、完整滚动起步/巡航/停车、滚动弯道横向加速度约束，
-以及实测状态保持静止时现有 MPC 的纵向输出能够持续增长。
+当前结果：轨迹库的 13 个 GTest、坐标适配的 6 个 GTest 和 2 个轨迹到 MPC 的管线测试
+全部通过。测试包含静止起步连续调用、完整滚动起步/巡航/停车、滚动弯道横向加速度约束、
+坐标偏置适配，以及大位置误差下参考相关速度上限仍能强制生效。
 
 ---
 

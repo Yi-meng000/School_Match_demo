@@ -14,7 +14,7 @@ TEST(TracingAdapterTest, RotatesBodyVelocityIntoWorldFrame)
   EXPECT_NEAR(velocity.y, 1.5, 1e-12);
 }
 
-TEST(TracingAdapterTest, RotatesWorldReferenceIntoReferenceBodyFrame)
+TEST(TracingAdapterTest, RotatesWorldCommandIntoCurrentBodyFrame)
 {
   const rt::Vector2 world_velocity{0.25, 1.5};
   const rt::Vector2 body_velocity = tracing::worldVelocityToBody(M_PI_2, world_velocity);
@@ -30,7 +30,7 @@ TEST(TracingAdapterTest, ExtractsPlanarYawFromQuaternion)
     M_PI_2, 1e-12);
 }
 
-TEST(TracingAdapterTest, AppliesCurrentLidarYawAlignmentOffset)
+TEST(TracingAdapterTest, SupportsOptionalLegacyLidarYawAlignmentOffset)
 {
   const double raw_yaw = tracing::yawFromQuaternion(
     0.0051228022112386916,
@@ -62,4 +62,17 @@ TEST(TracingAdapterTest, AppliesSameFrameAlignmentToLidarTwist)
   EXPECT_NEAR(chassis_velocity.y, 0.0, 1e-12);
   EXPECT_NEAR(world_velocity.x, 0.2, 1e-12);
   EXPECT_NEAR(world_velocity.y, 0.0, 1e-12);
+}
+
+TEST(TracingAdapterTest, CorrectedOdometryUsesRawYawAndTwistDirectly)
+{
+  constexpr double kYaw = 0.35;
+  const rt::Vector2 raw_twist{0.4, -0.2};
+  const double corrected_yaw = tracing::normalizeYaw(kYaw + 0.0);
+  const rt::Vector2 chassis_twist = tracing::rotatePlanarVelocity(
+    -0.0, raw_twist.x, raw_twist.y);
+
+  EXPECT_NEAR(corrected_yaw, kYaw, 1e-12);
+  EXPECT_NEAR(chassis_twist.x, raw_twist.x, 1e-12);
+  EXPECT_NEAR(chassis_twist.y, raw_twist.y, 1e-12);
 }

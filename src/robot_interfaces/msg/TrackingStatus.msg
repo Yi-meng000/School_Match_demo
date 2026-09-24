@@ -13,7 +13,7 @@ uint8 ODOMETRY_TIMEOUT=9
 
 std_msgs/Header header
 bool has_path
-uint32 path_id
+uint64 path_id
 uint8 state
 float64 progress
 float64 remaining_distance

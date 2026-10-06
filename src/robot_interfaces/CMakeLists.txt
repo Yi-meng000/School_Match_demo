@@ -17,8 +17,8 @@ find_package(geometry_msgs REQUIRED)
 # 将消息接口定义文件转化为库或头文件
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ChassisCmd.msg"
+  "msg/ChassisFeedback.msg"
   "msg/ControllerCmd.msg"
-  "msg/PlanPath.msg"
   "msg/TrackingDebug.msg"
   "msg/TrackingStatus.msg"
   DEPENDENCIES

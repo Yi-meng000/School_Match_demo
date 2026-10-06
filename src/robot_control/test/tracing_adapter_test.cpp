@@ -9,70 +9,33 @@ namespace tracing = robot_control::tracing;
 
 TEST(TracingAdapterTest, RotatesBodyVelocityIntoWorldFrame)
 {
-  const rt::Vector2 velocity = tracing::bodyVelocityToWorld(M_PI_2, 1.5, -0.25);
+  const rt::Vector2 velocity = tracing::bodyVelocityToWorld(
+    1.57079632679489661923, 1.5, -0.25);
   EXPECT_NEAR(velocity.x, 0.25, 1e-12);
   EXPECT_NEAR(velocity.y, 1.5, 1e-12);
 }
 
 TEST(TracingAdapterTest, RotatesWorldCommandIntoCurrentBodyFrame)
 {
-  const rt::Vector2 world_velocity{0.25, 1.5};
-  const rt::Vector2 body_velocity = tracing::worldVelocityToBody(M_PI_2, world_velocity);
-  EXPECT_NEAR(body_velocity.x, 1.5, 1e-12);
-  EXPECT_NEAR(body_velocity.y, -0.25, 1e-12);
+  const rt::Vector2 body = tracing::worldVelocityToBody(
+    1.57079632679489661923, {0.25, 1.5});
+  EXPECT_NEAR(body.x, 1.5, 1e-12);
+  EXPECT_NEAR(body.y, -0.25, 1e-12);
 }
 
 TEST(TracingAdapterTest, ExtractsPlanarYawFromQuaternion)
 {
-  const double half_yaw = M_PI / 4.0;
+  const double half_yaw = 3.14159265358979323846 / 4.0;
   EXPECT_NEAR(
-    tracing::yawFromQuaternion(0.0, 0.0, std::sin(half_yaw), std::cos(half_yaw)),
-    M_PI_2, 1e-12);
+    tracing::yawFromQuaternion(
+      0.0, 0.0, std::sin(half_yaw), std::cos(half_yaw)),
+    1.57079632679489661923, 1e-12);
 }
 
-TEST(TracingAdapterTest, SupportsOptionalLegacyLidarYawAlignmentOffset)
+TEST(TracingAdapterTest, GoalRequiresArcEndpointAndSpeedConditionsTogether)
 {
-  const double raw_yaw = tracing::yawFromQuaternion(
-    0.0051228022112386916,
-    0.0022843233499106738,
-    0.7119072488514794,
-    0.7022511002462406);
-  const double corrected_yaw = tracing::normalizeYaw(raw_yaw - M_PI_2);
-  const rt::Vector2 body_reference =
-    tracing::worldVelocityToBody(corrected_yaw, rt::Vector2{1.0, 0.0});
-
-  EXPECT_NEAR(raw_yaw * 180.0 / M_PI, 90.781218, 1e-6);
-  EXPECT_NEAR(corrected_yaw * 180.0 / M_PI, 0.781218, 1e-6);
-  EXPECT_GT(body_reference.x, 0.999);
-  EXPECT_NEAR(body_reference.y, -std::sin(corrected_yaw), 1e-12);
-}
-
-TEST(TracingAdapterTest, AppliesSameFrameAlignmentToLidarTwist)
-{
-  // The lidar child frame reports +90 deg when the physical chassis faces
-  // world +x.  A forward physical velocity is therefore (0, -v) in that raw
-  // child frame.  Correct yaw by -90 deg and rotate the twist by +90 deg.
-  constexpr double kYawOffset = -M_PI_2;
-  const rt::Vector2 chassis_velocity = tracing::rotatePlanarVelocity(
-    -kYawOffset, 0.0, -0.2);
-  const rt::Vector2 world_velocity = tracing::bodyVelocityToWorld(
-    M_PI_2 + kYawOffset, chassis_velocity.x, chassis_velocity.y);
-
-  EXPECT_NEAR(chassis_velocity.x, 0.2, 1e-12);
-  EXPECT_NEAR(chassis_velocity.y, 0.0, 1e-12);
-  EXPECT_NEAR(world_velocity.x, 0.2, 1e-12);
-  EXPECT_NEAR(world_velocity.y, 0.0, 1e-12);
-}
-
-TEST(TracingAdapterTest, CorrectedOdometryUsesRawYawAndTwistDirectly)
-{
-  constexpr double kYaw = 0.35;
-  const rt::Vector2 raw_twist{0.4, -0.2};
-  const double corrected_yaw = tracing::normalizeYaw(kYaw + 0.0);
-  const rt::Vector2 chassis_twist = tracing::rotatePlanarVelocity(
-    -0.0, raw_twist.x, raw_twist.y);
-
-  EXPECT_NEAR(corrected_yaw, kYaw, 1e-12);
-  EXPECT_NEAR(chassis_twist.x, raw_twist.x, 1e-12);
-  EXPECT_NEAR(chassis_twist.y, raw_twist.y, 1e-12);
+  EXPECT_TRUE(tracing::goalReached(0.02, 0.03, 0.04, 0.05, 0.05));
+  EXPECT_FALSE(tracing::goalReached(0.06, 0.03, 0.04, 0.05, 0.05));
+  EXPECT_FALSE(tracing::goalReached(0.02, 0.20, 0.04, 0.05, 0.05));
+  EXPECT_FALSE(tracing::goalReached(0.02, 0.03, 0.10, 0.05, 0.05));
 }

@@ -10,260 +10,206 @@ namespace robot_control
 namespace trajectory
 {
 
-// All positions, velocities and accelerations use one caller-defined world frame.
-struct Point2 // 世界坐标系位置
+// The complete library uses one caller-defined world frame and SI units.
+struct Point2 // 二维标量点
 {
-  double x{ 0.0 };
-  double y{ 0.0 };
+  double x{0.0};
+  double y{0.0};
 };
 
-struct Vector2 // 世界坐标系二维向量
+struct Vector2 // 二维矢量
 {
-  double x{ 0.0 };
-  double y{ 0.0 };
+  double x{0.0};
+  double y{0.0};
 };
 
-struct MotionState2D // 当前底盘状态（位置、速度）
+struct MotionState2D // 二维运动状态，包括位置和速度
 {
   Point2 position;
   Vector2 velocity;
 };
 
-// The translational library deliberately does not create a heading plan.  A caller
-// can use this optional value to merge a separate yaw plan into the MPC reference.
-struct HeadingReference // 外部yaw参考
+// Yaw is supplied by the caller. The translational library never derives it
+// from the path tangent and never constrains it.
+struct HeadingReference // 航向参考定义
 {
-  bool valid{ false };
-  double yaw{ 0.0 };
-  double angular_velocity{ 0.0 };
-  double angular_acceleration{ 0.0 };
+  bool valid{false};  // 该份航向参考是否有效，默认无效，区分有无提供的航向参考以及该航向参考是否有效
+  double yaw{0.0};    // 参考偏航角
+  double angular_velocity{0.0};       // 参考角速度
+  double angular_acceleration{0.0};   // 参考角加速度
 };
-
+//using 类型赋别名
+//std::function<返回类型(参数类型...)>函数变量，存同种类型的不同函数，在同一段代码实现中调用不同函数，内部只有一种实现，外部却是不同的函数传入
+//内部提供operator bool(),可在if中被判断，判断条件为，内部无调用对象为false, 有调用对象为true
 using HeadingProvider = std::function<HeadingReference(double time_s, double arc_length_m)>;
 
-struct PathBuildOptions // 路径构建参数
+// Defines the fixed spatial speed schedule v_des(s) created at path activation.
+// The terminal speed is deliberately fixed at zero.
+struct SpeedProfileOptions // 速度规划器配置
 {
-  double sample_spacing{ 0.02 };        // 平滑的采样间距m
-  double rdp_epsilon{ 0.03 };           // RDP抽稀容差m
-  double smooth_half_window{ 0.15 };    // 坐标滑动平均的半窗长度m
-  double max_smooth_deviation{ 0.05 };  // 路径与原始折线的最大允许偏差m, relative to the input polyline
-  int max_smoothing_attempts{ 5 }; // 平滑超偏差时窗口减半的最大尝试次数
+  double cruise_speed{-1.0};   // 巡航速度
+  double nominal_accel{-1.0};  // 最大加速度
+  double nominal_decel{-1.0};  // 最大减速度
+  double accel_fraction{0.20}; // 加速段占比
+  double decel_fraction{0.25}; // 减速段占比
+
+  bool isValid(std::string* error = nullptr) const; // 检查速度配置是否有效，末尾的const限制函数本身不能对结构体内部成员值进行修改
+  //函数本身返回值用来判断是否合法，函数传入的指针字符串说明非法原因
 };
 
-// Safety-related values are intentionally invalid until the caller supplies them.
-// This prevents an unnoticed default from becoming a vehicle safety limit.
-struct MotionLimits // 运动学约束
+struct GeneratorOptions // 轨迹生成器配置
 {
-  double cruise_speed{ -1.0 };       // 最高巡航速度 m/s
-  double max_accel{ -1.0 };          // 正常加速度上限 m/s^2, normal forward acceleration
-  double normal_decel{ -1.0 };       // 正常制动上限 m/s^2
-  double emergency_decel{ -1.0 };    // 紧急制动上限 m/s^2, must be >= normal_decel
-  double max_lateral_accel{ -1.0 };  // 横向加速度上限 m/s^2
-  double terminal_speed{ 0.0 };      // 末速度 m/s; zero stops at the path end
-  double accel_fraction{ 0.20 };     // 加速的剩余路径比例 desired fraction of remaining path
-  double decel_fraction{ 0.25 };     // 减速的剩余路径比例 desired fraction of remaining path
+  double max_activation_offset{0.50};         // 新路径激活时车辆到路径最近点允许的最大距离
+  // 路径搜索窗口限制，防止只凭最近点跳出路径
+  double local_projection_backtrack{1.0};     // 每周期定位路径进度时，允许从当前弧长向后搜索距离
+  double local_projection_lookahead{3.0};     // 每周期定位路径进度时，允许从当前弧长向前搜索距离
 
-  bool isValid(std::string* error = nullptr) const; // 检查运动学约束是否合理
+  bool isValid(std::string* error = nullptr) const; //检查参数是否合法
 };
 
-struct GeneratorOptions // 在线生成的配置
+struct PathSample  // 指定弧长s的几何查询结果，路径参考————>参考侧
 {
-  double max_activation_offset{ 0.50 };      // 切换新路径时车辆到新路径最近点最大距离 m: reject paths too far from the robot
-  double local_projection_backtrack{ 1.0 };  // 运行过程投影搜索回看距离 m
-  double local_projection_lookahead{ 3.0 };  // 运行过程投影搜索前看距离 m
-  double profile_spacing{ 0.02 };            // 速度包络离散使用的弧长间隔 m
-  double minimum_speed_for_time{ 1e-4 };     // 时间表除零保护的最小速度 m/s
-  double max_reference_lead{ 0.10 };         // 名义速度相位最多领先实测投影的弧长 m
-
-  // These default to true for a library caller. The ROS adapter can turn
-  // them off only for controlled chassis-characterisation tests: the fixed
-  // activation-time v_des(s) is then sent to the MPC without a feedback-driven
-  // curve/end-point braking envelope.
-  bool enforce_curve_speed_limit{ true };
-  bool enforce_dynamic_safety_envelope{ true };
+  Point2 position;            // 世界坐标
+  Vector2 tangent{1.0, 0.0};  // 前进方向（切线），转换世界系参考速度
+  double arc_length{0.0};     // 从路径起点沿路径走过路径s
+  double curvature{0.0};      // 曲率，用于控制法向加速度
 };
 
-struct PathSample // 某弧长位置的平滑路径位置、单位切线、弧长、曲率
+struct Projection  // 指定世界位置的路径查询结果，实际位置推测值————>反馈侧
 {
-  Point2 position;
-  Vector2 tangent{ 1.0, 0.0 };  // unit tangent in the world frame
-  double arc_length{ 0.0 };     // m
-  double curvature{ 0.0 };      // 1/m, signed
+  double arc_length{0.0};  // 对应沿路径距离s
+  double distance{0.0};    // 车离路径最近点的直线距离
 };
 
-struct Projection // 	车辆位置向路径投影后的弧长和投影距离。
-{
-  double arc_length{ 0.0 };
-  double distance{ 0.0 };
-};
-
-class PathGeometry
+// PathGeometry preserves the planner's geometry. It only validates finite
+// values and removes consecutive duplicate points before building lookup data.
+class PathGeometry  // 路径几何查询对象
 {
 public:
-  bool build(const std::vector<Point2>& raw_points, const PathBuildOptions& options, std::string* error = nullptr);
+  bool build(const std::vector<Point2>& points, std::string* error = nullptr);  // 构建路径入口；参数：路径点数组，错误信息存放字符串
+  bool valid() const { return valid_; }                                         // 查询路径是否有效
+  std::size_t size() const { return points_.size(); }                           // 查询路径包含路径点个数
+  double length() const { return total_length_; }                               // 查询路径总长度
+  const std::vector<Point2>& points() const { return points_; }                 // 返回路径点数组的只读引用
+  const std::vector<double>& sampleArcLengths() const { return arc_lengths_; }  // 返回弧长数组的只读引用
 
-  bool valid() const
-  {
-    return valid_;
-  }
-  std::size_t size() const
-  {
-    return arc_lengths_.size();
-  }
-  double length() const
-  {
-    return total_length_;
-  }
-  double maxSmoothDeviation() const
-  {
-    return max_smooth_deviation_;
-  }
-  const std::vector<double>& sampleArcLengths() const
-  {
-    return arc_lengths_;
-  }
+  PathSample sample(double arc_length) const;                                   // 沿路径走到弧长s时，对应的几何信息查询；参数：弧长，返回PathSample
 
-  PathSample sample(double arc_length) const;
-
-  // With a hint, projection searches the local route branch first and falls back
-  // to the entire path if that local match is implausibly far away.
-  Projection project(const Point2& position, double arc_length_hint = -1.0, double backtrack = 1.0,
-                     double lookahead = 3.0) const;
+  // A non-negative hint restricts the search to the current route branch.
+  // Pass a negative hint to explicitly search the complete path.
+  Projection project(    // 查询具体位置在路径桑对应进度；参数：位置（必须），弧长位置作为搜索提示（-1表示全局），向起点方向搜索距离，向终点方向搜索距离，返回Projection
+    const Point2& position, double arc_length_hint = -1.0,
+    double backtrack = 1.0, double lookahead = 3.0) const;                       
 
 private:
-  bool valid_{ false };
-  double total_length_{ 0.0 };
-  double max_smooth_deviation_{ 0.0 };
-  std::vector<double> arc_lengths_;
-  std::vector<Point2> points_;
-  std::vector<Vector2> tangents_;
-  std::vector<double> curvatures_;
+  Projection projectRange(const Point2& position, double s_lo, double s_hi) const; // 指定弧长区间的最近位置搜索，在project()内部调用
 
-  Projection projectRange(const Point2& position, double s_lo, double s_hi) const;
+  bool valid_{false};                   // 路径是否构建成功
+  double total_length_{0.0};            // 路径总长度
+  std::vector<double> arc_lengths_;     // 每个点对应的弧长距离
+  std::vector<Point2> points_;          // 按照路径顺序保存的二维点
+  std::vector<Vector2> tangents_;       // 每个点处的切线方向
+  std::vector<double> curvatures_;      // 每个点处的曲率
 };
-
-enum class TrajectoryStatus
+// 强类型枚举，不会自动转换成整数
+enum class TrajectoryStatus     // 轨迹状态枚举体
 {
   NoActivePath,
   Ready,
-  PathRejected,
-  EmergencyBraking,
-  EmergencyInfeasible
+  PathRejected
 };
 
-struct TrajectoryDiagnostics
+struct TrajectoryDiagnostics   //  轨迹当前运行状态
 {
-  TrajectoryStatus status{ TrajectoryStatus::NoActivePath };
-  double progress{ 0.0 };
-  double remaining_length{ 0.0 };
-  double normal_stop_distance{ 0.0 };
-  double emergency_stop_distance{ 0.0 };
-  double stop_deficit{ 0.0 };
-  double terminal_speed_if_unstoppable{ 0.0 };
+  TrajectoryStatus status{TrajectoryStatus::NoActivePath};    // 当前状态
+  double progress{0.0};                                       // 当前路径进度
+  double remaining_length{0.0};                               // 距离终点剩余路径距离
+  double speed_at_progress{0.0};                              // 当前进度处期望速度
+  // 目前仅做警告，不做其余制动
+  double required_peak_deceleration{0.0};                     // 当前路径正弦减速所需最大减速度大小
+  bool nominal_decel_exceeded{false};                         // 上述减速度大小是否超过nominal_decel
 };
 
-struct ReferencePoint // 参考轨迹点
+struct ReferencePoint // MPC参考状态
 {
-  double time_from_now{ 0.0 };
-  double arc_length{ 0.0 };
-  Point2 position;
-  Vector2 velocity;
-  Vector2 acceleration;
-  double speed{ 0.0 };
-  double tangential_acceleration{ 0.0 };
-  double curvature{ 0.0 };
-  HeadingReference heading;
+  double time_from_now{0.0};            // 距离本次预测还有多久(0.05 0.10 .... 1.00)
+  double arc_length{0.0};               // 参考点在路径上的弧长距离
+  Point2 position;                      // 参考世界坐标
+  Vector2 velocity;                     // 参考世界系速度
+  Vector2 acceleration;                 // 参考世界系加速度 (ax,ay)
+  double speed{0.0};                    // 速度大小，标量不区分方向
+  double tangential_acceleration{0.0};  // 沿路径方向加速度（加速为正，减速为负）
+  double curvature{0.0};                // 参考位置曲率
+  HeadingReference heading;             // 航向参考
+};
 
-  // Debug observability for the distinction between the persistent nominal
-  // v_des(s) and the dynamically feasible value sent to the MPC. These do
-  // not participate in trajectory generation.
-  double nominal_phase_arc_length{ 0.0 };
-  double nominal_phase_speed{ 0.0 };
-  double nominal_speed_at_progress{ 0.0 };
-  Vector2 nominal_phase_velocity;
-  bool reachability_limited{ false };
-  bool spatial_safety_limited{ false };
-}; 
-
-// Owns the currently accepted geometry and a persistent nominal speed phase.
-// Each horizon is position-anchored to the latest measured projection while the
-// nominal phase advances across calls. Safety envelopes are still rebuilt from
-// measured state on every request.
-class TrajectoryGenerator
+// The speed schedule is built exactly once for every accepted path activation.
+// Later control ticks only update monotonic measured progress and sample that
+// same spatial function, so a given arc length always has one desired speed.
+class TrajectoryGenerator // 轨迹生成对象，包含路径几何与速度规划
 {
 public:
-  explicit TrajectoryGenerator(const MotionLimits& limits, const GeneratorOptions& options = GeneratorOptions{});
+  /**
+   * @brief Construct a new Trajectory Generator object
+   * 
+   * @param speed_options      速度规划器配置
+   * @param generator_options  轨迹生成器配置（默认包含一个使用默认值的配置对象）
+   */
+  explicit TrajectoryGenerator(
+    const SpeedProfileOptions& speed_options,
+    const GeneratorOptions& generator_options = GeneratorOptions{});
 
-  bool setLimits(const MotionLimits& limits, std::string* error = nullptr);
-  const MotionLimits& limits() const
-  {
-    return limits_;
-  }
+  bool setSpeedProfileOptions(
+    const SpeedProfileOptions& options, std::string* error = nullptr); // 检查并设置速度规划器配置
+  const SpeedProfileOptions& speedProfileOptions() const { return speed_options_; } // 返回当前速度配置的只读引用
 
-  bool activatePath(const PathGeometry& geometry, const MotionState2D& current_state, std::string* error = nullptr);
+  bool activatePath(
+    const PathGeometry& geometry, const MotionState2D& current_state,
+    std::string* error = nullptr); // 把构建好的路径传入生成器，建立运动规划
+  void clearPath(); // 清除当前路径，重置轨迹生成器状态，保留path_id
 
-  void clearPath();
-  bool hasActivePath() const
-  {
-    return active_;
-  }
-  const PathGeometry& path() const
-  {
-    return path_;
-  }
-  const TrajectoryDiagnostics& diagnostics() const
-  {
-    return diagnostics_;
-  }
+  bool hasActivePath() const { return active_; }  // 查询当前是否有激活的路径
+  const PathGeometry& path() const { return path_; }    // 返回当前路径几何对象的只读引用
+  const TrajectoryDiagnostics& diagnostics() const { return diagnostics_; }
 
-  // Returns the current status. `out` is cleared on NoActivePath.  Sample zero is
-  // at dt seconds in the future, which is the usual first state in an MPC horizon.
-  TrajectoryStatus makeHorizon(const MotionState2D& current_state, double dt, std::size_t steps,
-                               std::vector<ReferencePoint>* out,
-                               const HeadingProvider& heading_provider = HeadingProvider{});
+  double desiredSpeed(double arc_length) const;
+  double profileStartArcLength() const { return profile_.start_arc_length; }
+  double profileDuration() const;
+
+  // Reference sample zero is dt seconds in the future.
+  TrajectoryStatus makeHorizon(
+    const MotionState2D& current_state, double dt, std::size_t steps,
+    std::vector<ReferencePoint>* out,
+    const HeadingProvider& heading_provider = HeadingProvider{});
 
 private:
-  struct ProfileNode
+  struct SinusoidalProfile
   {
-    double time{ 0.0 };
-    double arc_length{ 0.0 };
-    double speed{ 0.0 };
-    double tangential_acceleration{ 0.0 };
+    bool valid{false};
+    bool direct_deceleration{false};
+    double start_arc_length{0.0};
+    double length{0.0};
+    double start_speed{0.0};
+    double peak_speed{0.0};
+    double accel_distance{0.0};
+    double cruise_distance{0.0};
+    double decel_distance{0.0};
+    double accel_duration{0.0};
+    double cruise_duration{0.0};
+    double decel_duration{0.0};
   };
 
-  struct ExactSinusoid
-  {
-    bool active{ false };
-    bool direct_ramp{ false };
-    double start_arc_length{ 0.0 };
-    double length{ 0.0 };
-    double start_speed{ 0.0 };
-    double peak_speed{ 0.0 };
-    double end_speed{ 0.0 };
-    double accel_distance{ 0.0 };
-    double cruise_distance{ 0.0 };
-    double decel_distance{ 0.0 };
-  };
+  bool buildProfile(double start_arc_length, double start_speed);
+  double profileTimeAtArcLength(double arc_length) const;
+  ReferencePoint sampleProfileTime(double profile_time) const;
 
-  MotionLimits limits_;
-  GeneratorOptions options_;
+  SpeedProfileOptions speed_options_;
+  GeneratorOptions generator_options_;
   PathGeometry path_;
-  bool active_{ false };
-  double progress_{ 0.0 };
+  bool active_{false};
+  double progress_{0.0};
+  SinusoidalProfile profile_;
   TrajectoryDiagnostics diagnostics_;
-  std::vector<ProfileNode> profile_;
-  ExactSinusoid exact_nominal_;
-  std::vector<ProfileNode> reference_profile_;
-  ExactSinusoid reference_exact_nominal_;
-  double reference_time_{ 0.0 };
-
-  bool rebuildProfile(const MotionState2D& current_state, bool apply_nominal_shape);
-  ReferencePoint sampleProfile(const std::vector<ProfileNode>& profile, const ExactSinusoid& exact_nominal,
-                               double profile_time) const;
-  double profileSpeedAtArcLength(const std::vector<ProfileNode>& profile, double arc_length) const;
-  double profileDuration(const std::vector<ProfileNode>& profile, const ExactSinusoid& exact_nominal) const;
-  double profileTimeAtArcLength(const std::vector<ProfileNode>& profile, const ExactSinusoid& exact_nominal,
-                                double arc_length) const;
 };
 
 }  // namespace trajectory

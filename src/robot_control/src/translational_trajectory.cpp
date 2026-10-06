@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace robot_control
 {
@@ -13,8 +14,6 @@ namespace
 
 constexpr double kEps = 1e-9;
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kSpeedFeasibilityTolerance = 1e-3;
-constexpr double kNoLocalSpeedCap = 1e3;
 
 bool finite(double value)
 {
@@ -33,17 +32,17 @@ double clamp(double value, double lo, double hi)
 
 Vector2 subtract(const Point2& a, const Point2& b)
 {
-  return { a.x - b.x, a.y - b.y };
+  return {a.x - b.x, a.y - b.y};
 }
 
 Vector2 scale(const Vector2& vector, double scalar)
 {
-  return { vector.x * scalar, vector.y * scalar };
+  return {vector.x * scalar, vector.y * scalar};
 }
 
 Vector2 add(const Vector2& a, const Vector2& b)
 {
-  return { a.x + b.x, a.y + b.y };
+  return {a.x + b.x, a.y + b.y};
 }
 
 double dot(const Vector2& a, const Vector2& b)
@@ -64,669 +63,466 @@ double norm(const Vector2& vector)
 Vector2 normalized(const Vector2& vector)
 {
   const double length = norm(vector);
-  if (length < kEps)
-  {
-    return { 1.0, 0.0 };
+  if (length <= kEps) {
+    return {1.0, 0.0};
   }
-  return { vector.x / length, vector.y / length };
+  return {vector.x / length, vector.y / length};
 }
 
-Point2 lerp(const Point2& a, const Point2& b, double t)
+Point2 lerp(const Point2& a, const Point2& b, double ratio)
 {
-  return { a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t };
+  return {
+    a.x + (b.x - a.x) * ratio,
+    a.y + (b.y - a.y) * ratio};
 }
 
-double distanceSquaredToSegment(const Point2& point, const Point2& a, const Point2& b, double* projection = nullptr)
+double distanceSquaredToSegment(
+  const Point2& point, const Point2& a, const Point2& b,
+  double* projection = nullptr)
 {
   const Vector2 ab = subtract(b, a);
   const Vector2 ap = subtract(point, a);
   const double length_squared = dot(ab, ab);
-  double t = 0.0;
-  if (length_squared > kEps)
-  {
-    t = clamp(dot(ap, ab) / length_squared, 0.0, 1.0);
+  double ratio = 0.0;
+  if (length_squared > kEps) {
+    ratio = clamp(dot(ap, ab) / length_squared, 0.0, 1.0);
   }
-  if (projection != nullptr)
-  {
-    *projection = t;
+  if (projection != nullptr) {
+    *projection = ratio;
   }
-  const Point2 closest = lerp(a, b, t);
+  const Point2 closest = lerp(a, b, ratio);
   const double dx = point.x - closest.x;
   const double dy = point.y - closest.y;
   return dx * dx + dy * dy;
 }
 
-double pointToPolylineDistanceSquared(const Point2& point, const std::vector<Point2>& polyline)
-{
-  double best = std::numeric_limits<double>::infinity();
-  for (std::size_t i = 0; i + 1 < polyline.size(); ++i)
-  {
-    best = std::min(best, distanceSquaredToSegment(point, polyline[i], polyline[i + 1]));
-  }
-  return best;
-}
-
-void rdp(const std::vector<Point2>& input, std::size_t first, std::size_t last, double epsilon,
-         std::vector<Point2>* output)
-{
-  double worst_distance = -1.0;
-  std::size_t worst_index = first;
-  for (std::size_t i = first + 1; i < last; ++i)
-  {
-    const double d2 = distanceSquaredToSegment(input[i], input[first], input[last]);
-    if (d2 > worst_distance)
-    {
-      worst_distance = d2;
-      worst_index = i;
-    }
-  }
-
-  if (worst_distance > epsilon * epsilon && worst_index > first && worst_index < last)
-  {
-    rdp(input, first, worst_index, epsilon, output);
-    output->pop_back();
-    rdp(input, worst_index, last, epsilon, output);
-    return;
-  }
-
-  output->push_back(input[first]);
-  output->push_back(input[last]);
-}
-
-bool resamplePolyline(const std::vector<Point2>& input, double spacing, std::vector<Point2>* output)
-{
-  output->clear();
-  if (input.size() < 2 || spacing <= kEps)
-  {
-    return false;
-  }
-
-  std::vector<double> cumulative(input.size(), 0.0);
-  for (std::size_t i = 1; i < input.size(); ++i)
-  {
-    cumulative[i] = cumulative[i - 1] + norm(subtract(input[i], input[i - 1]));
-  }
-  const double total = cumulative.back();
-  if (total <= kEps)
-  {
-    return false;
-  }
-
-  const std::size_t steps = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(total / spacing)));
-  output->reserve(steps + 1);
-  std::size_t segment = 0;
-  for (std::size_t i = 0; i <= steps; ++i)
-  {
-    const double target = (i == steps) ? total : total * static_cast<double>(i) / static_cast<double>(steps);
-    while (segment + 1 < cumulative.size() - 1 && cumulative[segment + 1] < target)
-    {
-      ++segment;
-    }
-    const double begin = cumulative[segment];
-    const double end = cumulative[segment + 1];
-    const double ratio = (end - begin > kEps) ? (target - begin) / (end - begin) : 0.0;
-    output->push_back(lerp(input[segment], input[segment + 1], clamp(ratio, 0.0, 1.0)));
-  }
-  output->front() = input.front();
-  output->back() = input.back();
-  return true;
-}
-
-void smoothPolyline(std::vector<Point2>* points, int half_window)
-{
-  if (points->size() < 2 || half_window <= 0)
-  {
-    return;
-  }
-
-  const std::vector<Point2> original = *points;
-  const int size = static_cast<int>(original.size());
-  auto sample = [&original, size](int index) {
-    if (index < 0)
-    {
-      const double k = static_cast<double>(-index);
-      return Point2{ (k + 1.0) * original[0].x - k * original[1].x, (k + 1.0) * original[0].y - k * original[1].y };
-    }
-    if (index >= size)
-    {
-      const double k = static_cast<double>(index - (size - 1));
-      return Point2{ (k + 1.0) * original[size - 1].x - k * original[size - 2].x,
-                     (k + 1.0) * original[size - 1].y - k * original[size - 2].y };
-    }
-    return original[index];
-  };
-
-  for (int i = 0; i < size; ++i)
-  {
-    Point2 sum{};
-    for (int offset = -half_window; offset <= half_window; ++offset)
-    {
-      const Point2 value = sample(i + offset);
-      sum.x += value.x;
-      sum.y += value.y;
-    }
-    const double divisor = static_cast<double>(2 * half_window + 1);
-    (*points)[i] = { sum.x / divisor, sum.y / divisor };
-  }
-}
-
-double symmetricPolylineDeviation(const std::vector<Point2>& original, const std::vector<Point2>& smoothed)
-{
-  double worst_squared = 0.0;
-  for (const Point2& point : original)
-  {
-    worst_squared = std::max(worst_squared, pointToPolylineDistanceSquared(point, smoothed));
-  }
-  for (const Point2& point : smoothed)
-  {
-    worst_squared = std::max(worst_squared, pointToPolylineDistanceSquared(point, original));
-  }
-  return std::sqrt(worst_squared);
-}
-
-void buildGeometryTable(const std::vector<Point2>& points, std::vector<double>* arc_lengths,
-                        std::vector<Vector2>* tangents, std::vector<double>* curvatures, double* total_length)
+void buildGeometryTable(
+  const std::vector<Point2>& points, std::vector<double>* arc_lengths,
+  std::vector<Vector2>* tangents, std::vector<double>* curvatures,
+  double* total_length)
 {
   arc_lengths->assign(points.size(), 0.0);
-  tangents->assign(points.size(), { 1.0, 0.0 });
+  tangents->assign(points.size(), {1.0, 0.0});
   curvatures->assign(points.size(), 0.0);
-  for (std::size_t i = 1; i < points.size(); ++i)
-  {
-    (*arc_lengths)[i] = (*arc_lengths)[i - 1] + norm(subtract(points[i], points[i - 1]));
+
+  for (std::size_t i = 1; i < points.size(); ++i) {
+    (*arc_lengths)[i] =
+      (*arc_lengths)[i - 1] + norm(subtract(points[i], points[i - 1]));
   }
   *total_length = arc_lengths->back();
 
-  for (std::size_t i = 0; i < points.size(); ++i)
-  {
-    const std::size_t before = (i == 0) ? 0 : i - 1;
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    const std::size_t before = i == 0 ? 0 : i - 1;
     const std::size_t after = std::min(points.size() - 1, i + 1);
     (*tangents)[i] = normalized(subtract(points[after], points[before]));
   }
 
-  if (points.size() < 3)
-  {
+  if (points.size() < 3) {
     return;
   }
-  for (std::size_t i = 1; i + 1 < points.size(); ++i)
-  {
+  for (std::size_t i = 1; i + 1 < points.size(); ++i) {
     const Vector2 a = subtract(points[i], points[i - 1]);
     const Vector2 b = subtract(points[i + 1], points[i]);
-    const Vector2 c = subtract(points[i + 1], points[i - 1]);
-    const double denominator = norm(a) * norm(b) * norm(c);
-    if (denominator > kEps)
-    {
+    const Vector2 chord = subtract(points[i + 1], points[i - 1]);
+    const double denominator = norm(a) * norm(b) * norm(chord);
+    if (denominator > kEps) {
       (*curvatures)[i] = 2.0 * cross(a, b) / denominator;
     }
   }
-  (*curvatures).front() = (*curvatures)[1];
-  (*curvatures).back() = (*curvatures)[(*curvatures).size() - 2];
+  curvatures->front() = (*curvatures)[1];
+  curvatures->back() = (*curvatures)[curvatures->size() - 2];
 }
 
-double minimumSinusoidalDistance(double start_speed, double end_speed, double acceleration)
+double minimumSinusoidalDistance(
+  double start_speed, double end_speed, double acceleration)
 {
-  if (acceleration <= kEps)
-  {
+  if (acceleration <= kEps) {
     return std::numeric_limits<double>::infinity();
   }
-  return kPi * std::fabs(end_speed * end_speed - start_speed * start_speed) / (4.0 * acceleration);
+  return kPi * std::fabs(
+    end_speed * end_speed - start_speed * start_speed) / (4.0 * acceleration);
 }
 
-double inverseSinusoidalPhase(double duration, double start_speed, double end_speed, double distance)
+double rampDuration(double distance, double start_speed, double end_speed)
 {
-  if (duration <= kEps)
-  {
+  const double speed_sum = start_speed + end_speed;
+  if (distance <= kEps || speed_sum <= kEps) {
     return 0.0;
   }
-  const double delta = end_speed - start_speed;
-  const double mean = 0.5 * (start_speed + end_speed);
-  if (mean <= kEps)
-  {
-    return 0.0;
-  }
+  return 2.0 * distance / speed_sum;
+}
 
+struct RampValue
+{
+  double distance{0.0};
+  double speed{0.0};
+  double acceleration{0.0};
+};
+
+RampValue sampleRamp(
+  double duration, double start_speed, double end_speed, double time)
+{
+  if (duration <= kEps) {
+    return {0.0, end_speed, 0.0};
+  }
+  const double clamped_time = clamp(time, 0.0, duration);
+  const double delta = end_speed - start_speed;
+  const double angle = kPi * clamped_time / duration;
+  RampValue result;
+  result.distance = 0.5 * (start_speed + end_speed) * clamped_time -
+    delta * duration * std::sin(angle) / (2.0 * kPi);
+  result.speed = start_speed + 0.5 * delta * (1.0 - std::cos(angle));
+  result.acceleration = 0.5 * delta * kPi * std::sin(angle) / duration;
+  return result;
+}
+
+double inverseRampTime(
+  double duration, double start_speed, double end_speed, double distance)
+{
+  if (duration <= kEps) {
+    return 0.0;
+  }
+  const double total_distance = 0.5 * (start_speed + end_speed) * duration;
+  const double target = clamp(distance, 0.0, total_distance);
   double lo = 0.0;
   double hi = duration;
-  double time = clamp(distance / mean, 0.0, duration);
-  for (int iteration = 0; iteration < 60; ++iteration)
-  {
-    const double phase = kPi * time / duration;
-    const double residual = mean * time - (delta * duration / (2.0 * kPi)) * std::sin(phase) - distance;
-    if (residual > 0.0)
-    {
-      hi = time;
+  double time = total_distance > kEps ? duration * target / total_distance : 0.0;
+
+  for (int iteration = 0; iteration < 60; ++iteration) {
+    const RampValue value = sampleRamp(duration, start_speed, end_speed, time);
+    const double residual = value.distance - target;
+    if (std::fabs(residual) <= 1e-12 * std::max(1.0, total_distance)) {
+      break;
     }
-    else
-    {
+    if (residual > 0.0) {
+      hi = time;
+    } else {
       lo = time;
     }
-    const double derivative = mean - 0.5 * delta * std::cos(phase);
-    double next = derivative > kEps ? time - residual / derivative : 0.5 * (lo + hi);
-    if (!(next > lo && next < hi))
-    {
+    double next = value.speed > kEps ? time - residual / value.speed : 0.5 * (lo + hi);
+    if (!(next > lo && next < hi)) {
       next = 0.5 * (lo + hi);
-    }
-    if (std::fabs(next - time) < 1e-13 * std::max(1.0, duration))
-    {
-      return next;
     }
     time = next;
   }
-  return time;
-}
-
-struct NominalSpeedShape
-{
-  bool valid{ false };
-  bool direct_ramp{ false };
-  double length{ 0.0 };
-  double start_speed{ 0.0 };
-  double peak_speed{ 0.0 };
-  double end_speed{ 0.0 };
-  double accel_distance{ 0.0 };
-  double cruise_distance{ 0.0 };
-  double decel_distance{ 0.0 };
-  double accel_limit{ 0.0 };
-  double decel_limit{ 0.0 };
-
-  bool build(double path_length, double start, const MotionLimits& limits)
-  {
-    length = path_length;
-    start_speed = std::max(0.0, start);
-    end_speed = std::max(0.0, limits.terminal_speed);
-    accel_limit = limits.max_accel;
-    decel_limit = limits.normal_decel;
-    if (length <= kEps)
-    {
-      return false;
-    }
-
-    // If the vehicle is already above cruise, a single smooth ramp is the
-    // least surprising nominal request.  Infeasible cases are later handled
-    // by the hard acceleration envelope and emergency state.
-    if (start_speed > limits.cruise_speed + kEps)
-    {
-      if (minimumSinusoidalDistance(start_speed, end_speed, decel_limit) > length + 1e-8)
-      {
-        return false;
-      }
-      direct_ramp = true;
-      peak_speed = start_speed;
-      decel_distance = length;
-      valid = true;
-      return true;
-    }
-
-    const double c_accel = kPi / (4.0 * accel_limit);
-    const double c_decel = kPi / (4.0 * decel_limit);
-    const double maximum_peak = std::sqrt(std::max(
-        0.0, (length + c_accel * start_speed * start_speed + c_decel * end_speed * end_speed) / (c_accel + c_decel)));
-    peak_speed = std::min(limits.cruise_speed, maximum_peak);
-    peak_speed = std::max(peak_speed, std::max(start_speed, end_speed));
-
-    const double accel_min = minimumSinusoidalDistance(start_speed, peak_speed, accel_limit);
-    const double decel_min = minimumSinusoidalDistance(peak_speed, end_speed, decel_limit);
-    if (accel_min + decel_min > length + 1e-8)
-    {
-      return false;
-    }
-
-    accel_distance = std::max(limits.accel_fraction * length, accel_min);
-    decel_distance = std::max(limits.decel_fraction * length, decel_min);
-    if (accel_distance + decel_distance > length)
-    {
-      const double excess = accel_distance + decel_distance - length;
-      const double accel_slack = accel_distance - accel_min;
-      const double decel_slack = decel_distance - decel_min;
-      const double slack = accel_slack + decel_slack;
-      if (slack > kEps)
-      {
-        accel_distance -= excess * accel_slack / slack;
-        decel_distance -= excess * decel_slack / slack;
-      }
-    }
-    cruise_distance = std::max(0.0, length - accel_distance - decel_distance);
-    valid = true;
-    return true;
-  }
-
-  double rampSpeed(double distance, double from, double to, double progress) const
-  {
-    if (distance <= kEps)
-    {
-      return to;
-    }
-    const double sum = from + to;
-    if (sum <= kEps)
-    {
-      return to;
-    }
-    const double duration = 2.0 * distance / sum;
-    const double time = inverseSinusoidalPhase(duration, from, to, clamp(progress, 0.0, distance));
-    return from + 0.5 * (to - from) * (1.0 - std::cos(kPi * time / duration));
-  }
-
-  double speedAt(double progress) const
-  {
-    if (!valid)
-    {
-      return std::numeric_limits<double>::infinity();
-    }
-    const double s = clamp(progress, 0.0, length);
-    if (direct_ramp)
-    {
-      return rampSpeed(length, start_speed, end_speed, s);
-    }
-    if (s <= accel_distance)
-    {
-      return rampSpeed(accel_distance, start_speed, peak_speed, s);
-    }
-    if (s <= accel_distance + cruise_distance)
-    {
-      return peak_speed;
-    }
-    return rampSpeed(decel_distance, peak_speed, end_speed, s - accel_distance - cruise_distance);
-  }
-};
-
-std::vector<double> backwardEnvelope(const std::vector<double>& caps, const std::vector<double>& arc_lengths,
-                                     double terminal_speed, double decel)
-{
-  std::vector<double> result(caps.size(), 0.0);
-  if (caps.empty())
-  {
-    return result;
-  }
-  result.back() = std::min(caps.back(), terminal_speed);
-  for (std::size_t reverse = caps.size() - 1; reverse > 0; --reverse)
-  {
-    const std::size_t i = reverse - 1;
-    const double ds = std::max(0.0, arc_lengths[i + 1] - arc_lengths[i]);
-    const double reachable = std::sqrt(std::max(0.0, result[i + 1] * result[i + 1] + 2.0 * decel * ds));
-    result[i] = std::min(caps[i], reachable);
-  }
-  return result;
+  return clamp(time, 0.0, duration);
 }
 
 }  // namespace
 
-bool MotionLimits::isValid(std::string* error) const
+bool SpeedProfileOptions::isValid(std::string* error) const
 {
-  const bool finite_values = finite(cruise_speed) && finite(max_accel) && finite(normal_decel) &&
-                             finite(emergency_decel) && finite(max_lateral_accel) && finite(terminal_speed) &&
-                             finite(accel_fraction) && finite(decel_fraction);
-  if (!finite_values || cruise_speed <= 0.0 || max_accel <= 0.0 || normal_decel <= 0.0 || emergency_decel <= 0.0 ||
-      max_lateral_accel <= 0.0 || terminal_speed < 0.0 || accel_fraction < 0.0 || decel_fraction < 0.0)
+  if (!finite(cruise_speed) || !finite(nominal_accel) || !finite(nominal_decel) ||
+      !finite(accel_fraction) || !finite(decel_fraction) ||
+      cruise_speed <= 0.0 || nominal_accel <= 0.0 || nominal_decel <= 0.0 ||
+      accel_fraction < 0.0 || decel_fraction < 0.0)
   {
-    if (error != nullptr)
-    {
-      *error = "MotionLimits contains missing, non-finite, or non-positive physical limits";
-    }
-    return false;
-  }
-  if (emergency_decel + kEps < normal_decel)
-  {
-    if (error != nullptr)
-    {
-      *error = "emergency_decel must be greater than or equal to normal_decel";
-    }
-    return false;
-  }
-  if (terminal_speed > cruise_speed + kEps)
-  {
-    if (error != nullptr)
-    {
-      *error = "terminal_speed must not exceed cruise_speed";
+    if (error != nullptr) {
+      *error = "SpeedProfileOptions requires finite positive speeds/accelerations and non-negative fractions";
     }
     return false;
   }
   return true;
 }
 
-bool PathGeometry::build(const std::vector<Point2>& raw_points, const PathBuildOptions& options, std::string* error)
+bool GeneratorOptions::isValid(std::string* error) const
+{
+  if (!finite(max_activation_offset) || !finite(local_projection_backtrack) ||
+      !finite(local_projection_lookahead) || max_activation_offset < 0.0 ||
+      local_projection_backtrack < 0.0 || local_projection_lookahead < 0.0)
+  {
+    if (error != nullptr) {
+      *error = "GeneratorOptions requires finite non-negative distances";
+    }
+    return false;
+  }
+  return true;
+}
+
+bool PathGeometry::build(const std::vector<Point2>& points, std::string* error)
 {
   valid_ = false;
   total_length_ = 0.0;
-  max_smooth_deviation_ = 0.0;
   arc_lengths_.clear();
   points_.clear();
   tangents_.clear();
   curvatures_.clear();
 
-  if (options.sample_spacing <= kEps || options.rdp_epsilon < 0.0 || options.smooth_half_window < 0.0 ||
-      options.max_smooth_deviation < 0.0 || options.max_smoothing_attempts < 1)
-  {
-    if (error != nullptr)
-    {
-      *error = "PathBuildOptions contains invalid values";
-    }
-    return false;
-  }
-
-  std::vector<Point2> input;
-  input.reserve(raw_points.size());
-  for (const Point2& point : raw_points)
-  {
-    if (!finitePoint(point))
-    {
-      if (error != nullptr)
-      {
+  points_.reserve(points.size());
+  for (const Point2& point : points) {
+    if (!finitePoint(point)) {
+      points_.clear();
+      if (error != nullptr) {
         *error = "Path contains NaN or infinity";
       }
       return false;
     }
-    if (input.empty() || norm(subtract(point, input.back())) > kEps)
-    {
-      input.push_back(point);
+    if (points_.empty() || norm(subtract(point, points_.back())) > kEps) {
+      points_.push_back(point);
     }
   }
-  if (input.size() < 2)
-  {
-    if (error != nullptr)
-    {
-      *error = "Path has fewer than two distinct points";
+
+  if (points_.size() < 2) {
+    points_.clear();
+    if (error != nullptr) {
+      *error = "Path has fewer than two distinct consecutive points";
     }
     return false;
   }
 
-  std::vector<Point2> simplified;
-  rdp(input, 0, input.size() - 1, options.rdp_epsilon, &simplified);
-  if (simplified.size() < 2)
-  {
-    if (error != nullptr)
-    {
-      *error = "RDP simplification removed the whole path";
+  buildGeometryTable(
+    points_, &arc_lengths_, &tangents_, &curvatures_, &total_length_);
+  if (total_length_ <= kEps) {
+    points_.clear();
+    arc_lengths_.clear();
+    tangents_.clear();
+    curvatures_.clear();
+    if (error != nullptr) {
+      *error = "Path length is zero";
     }
     return false;
   }
 
-  double half_window = options.smooth_half_window;
-  for (int attempt = 0; attempt < options.max_smoothing_attempts; ++attempt)
-  {
-    std::vector<Point2> dense;
-    if (!resamplePolyline(simplified, options.sample_spacing, &dense))
-    {
-      break;
-    }
-    const Point2 original_first = dense.front();
-    const Point2 original_last = dense.back();
-    const int window = static_cast<int>(std::lround(half_window / options.sample_spacing));
-    smoothPolyline(&dense, window);
-    // Linear extrapolation avoids shrinking a straight path, but curved path
-    // endpoints must still be anchored exactly at the planner's endpoints.
-    dense.front() = original_first;
-    dense.back() = original_last;
-
-    std::vector<Point2> uniform;
-    if (!resamplePolyline(dense, options.sample_spacing, &uniform))
-    {
-      break;
-    }
-    const double deviation = symmetricPolylineDeviation(input, uniform);
-    if (deviation <= options.max_smooth_deviation + 1e-9)
-    {
-      std::vector<double> arc_lengths;
-      std::vector<Vector2> tangents;
-      std::vector<double> curvatures;
-      double length = 0.0;
-      buildGeometryTable(uniform, &arc_lengths, &tangents, &curvatures, &length);
-      if (length <= kEps)
-      {
-        break;
-      }
-      points_ = std::move(uniform);
-      arc_lengths_ = std::move(arc_lengths);
-      tangents_ = std::move(tangents);
-      curvatures_ = std::move(curvatures);
-      total_length_ = length;
-      max_smooth_deviation_ = deviation;
-      valid_ = true;
-      return true;
-    }
-    half_window *= 0.5;
-  }
-
-  if (error != nullptr)
-  {
-    *error = "Smoothed path exceeds max_smooth_deviation";
-  }
-  return false;
+  valid_ = true;
+  return true;
 }
 
 PathSample PathGeometry::sample(double arc_length) const
 {
   PathSample result;
-  if (!valid_ || points_.empty())
-  {
+  if (!valid_ || points_.size() < 2) {
     return result;
   }
+
   const double s = clamp(arc_length, 0.0, total_length_);
   const auto upper = std::upper_bound(arc_lengths_.begin(), arc_lengths_.end(), s);
   std::size_t index = 0;
-  if (upper == arc_lengths_.begin())
-  {
-    index = 0;
-  }
-  else if (upper == arc_lengths_.end())
-  {
+  if (upper == arc_lengths_.end()) {
     index = arc_lengths_.size() - 2;
-  }
-  else
-  {
+  } else if (upper != arc_lengths_.begin()) {
     index = static_cast<std::size_t>(upper - arc_lengths_.begin() - 1);
   }
+
   const double span = arc_lengths_[index + 1] - arc_lengths_[index];
   const double ratio = span > kEps ? (s - arc_lengths_[index]) / span : 0.0;
   result.position = lerp(points_[index], points_[index + 1], ratio);
-  result.tangent = normalized(add(scale(tangents_[index], 1.0 - ratio), scale(tangents_[index + 1], ratio)));
+  result.tangent = normalized(add(
+    scale(tangents_[index], 1.0 - ratio),
+    scale(tangents_[index + 1], ratio)));
   result.arc_length = s;
-  result.curvature = curvatures_[index] + (curvatures_[index + 1] - curvatures_[index]) * ratio;
+  result.curvature = curvatures_[index] +
+    (curvatures_[index + 1] - curvatures_[index]) * ratio;
   return result;
 }
 
-Projection PathGeometry::projectRange(const Point2& position, double s_lo, double s_hi) const
+Projection PathGeometry::projectRange(
+  const Point2& position, double s_lo, double s_hi) const
 {
   Projection result;
   result.distance = std::numeric_limits<double>::infinity();
-  if (!valid_ || points_.size() < 2)
-  {
+  if (!valid_ || points_.size() < 2) {
     return result;
   }
+
   s_lo = clamp(s_lo, 0.0, total_length_);
   s_hi = clamp(s_hi, 0.0, total_length_);
-  if (s_lo > s_hi)
-  {
+  if (s_lo > s_hi) {
     std::swap(s_lo, s_hi);
   }
 
   const auto first_upper = std::upper_bound(arc_lengths_.begin(), arc_lengths_.end(), s_lo);
   const auto last_upper = std::upper_bound(arc_lengths_.begin(), arc_lengths_.end(), s_hi);
-  std::size_t first =
-      first_upper == arc_lengths_.begin() ? 0 : static_cast<std::size_t>(first_upper - arc_lengths_.begin() - 1);
-  std::size_t last = std::min(points_.size() - 2, static_cast<std::size_t>(last_upper - arc_lengths_.begin()));
-  if (last < first)
-  {
+  std::size_t first = first_upper == arc_lengths_.begin() ? 0 :
+    static_cast<std::size_t>(first_upper - arc_lengths_.begin() - 1);
+  std::size_t last = std::min(
+    points_.size() - 2,
+    static_cast<std::size_t>(last_upper - arc_lengths_.begin()));
+  if (last < first) {
     last = first;
   }
 
-  for (std::size_t i = first; i <= last; ++i)
-  {
-    const double segment_length = arc_lengths_[i + 1] - arc_lengths_[i];
+  double best_squared = std::numeric_limits<double>::infinity();
+  for (std::size_t i = first; i <= last; ++i) {
     double ratio = 0.0;
-    const double d2 = distanceSquaredToSegment(position, points_[i], points_[i + 1], &ratio);
-    double candidate_s = arc_lengths_[i] + ratio * segment_length;
-    candidate_s = clamp(candidate_s, s_lo, s_hi);
-    const PathSample candidate = sample(candidate_s);
-    const double dx = position.x - candidate.position.x;
-    const double dy = position.y - candidate.position.y;
-    const double restricted_d2 = dx * dx + dy * dy;
-    (void)d2;
-    if (restricted_d2 < result.distance * result.distance)
-    {
+    distanceSquaredToSegment(position, points_[i], points_[i + 1], &ratio);
+    const double segment_length = arc_lengths_[i + 1] - arc_lengths_[i];
+    const double candidate_s = clamp(
+      arc_lengths_[i] + ratio * segment_length, s_lo, s_hi);
+    const Point2 candidate = sample(candidate_s).position;
+    const double dx = position.x - candidate.x;
+    const double dy = position.y - candidate.y;
+    const double distance_squared = dx * dx + dy * dy;
+    if (distance_squared < best_squared) {
+      best_squared = distance_squared;
       result.arc_length = candidate_s;
-      result.distance = std::sqrt(restricted_d2);
     }
   }
+  result.distance = std::sqrt(best_squared);
   return result;
 }
 
-Projection PathGeometry::project(const Point2& position, double arc_length_hint, double backtrack,
-                                 double lookahead) const
+Projection PathGeometry::project(
+  const Point2& position, double arc_length_hint,
+  double backtrack, double lookahead) const
 {
-  if (!valid_)
-  {
+  if (!valid_) {
     return {};
   }
-  if (arc_length_hint < 0.0)
-  {
+  if (arc_length_hint < 0.0) {
     return projectRange(position, 0.0, total_length_);
   }
-  Projection local =
-      projectRange(position, arc_length_hint - std::max(0.0, backtrack), arc_length_hint + std::max(0.0, lookahead));
-  if (local.distance > 0.5)
-  {
-    return projectRange(position, 0.0, total_length_);
-  }
-  return local;
+  return projectRange(
+    position,
+    arc_length_hint - std::max(0.0, backtrack),
+    arc_length_hint + std::max(0.0, lookahead));
 }
 
-TrajectoryGenerator::TrajectoryGenerator(const MotionLimits& limits, const GeneratorOptions& options)
-  : limits_(limits), options_(options)
+TrajectoryGenerator::TrajectoryGenerator(
+  const SpeedProfileOptions& speed_options,
+  const GeneratorOptions& generator_options)
+: speed_options_(speed_options), generator_options_(generator_options)
 {
 }
 
-bool TrajectoryGenerator::setLimits(const MotionLimits& limits, std::string* error)
+bool TrajectoryGenerator::setSpeedProfileOptions(
+  const SpeedProfileOptions& options, std::string* error)
 {
-  if (!limits.isValid(error))
-  {
+  if (!options.isValid(error)) {
     return false;
   }
-  limits_ = limits;
+  speed_options_ = options;
+  clearPath();
   return true;
 }
 
-bool TrajectoryGenerator::activatePath(const PathGeometry& geometry, const MotionState2D& current_state,
-                                       std::string* error)
+bool TrajectoryGenerator::buildProfile(
+  double start_arc_length, double start_speed)
 {
-  if (!limits_.isValid(error))
+  profile_ = {};
+  profile_.start_arc_length = start_arc_length;
+  profile_.length = std::max(0.0, path_.length() - start_arc_length);
+  profile_.start_speed = std::max(0.0, start_speed);
+
+  diagnostics_.required_peak_deceleration = 0.0;
+  diagnostics_.nominal_decel_exceeded = false;
+
+  if (profile_.length <= kEps) {
+    profile_.start_speed = 0.0;
+    profile_.peak_speed = 0.0;
+    profile_.valid = true;
+    return true;
+  }
+
+  const double minimum_stop_distance = minimumSinusoidalDistance(
+    profile_.start_speed, 0.0, speed_options_.nominal_decel);
+
+  // Above-cruise activation and insufficient stopping distance both use one
+  // deterministic sine ramp over all remaining path.  This preserves a zero
+  // terminal speed without introducing an emergency state or changing v_des(s)
+  // on later control ticks.
+  if (profile_.start_speed > speed_options_.cruise_speed + kEps ||
+      minimum_stop_distance > profile_.length + kEps)
   {
+    profile_.direct_deceleration = true;
+    profile_.peak_speed = profile_.start_speed;
+    profile_.decel_distance = profile_.length;
+    profile_.decel_duration = rampDuration(
+      profile_.decel_distance, profile_.start_speed, 0.0);
+    diagnostics_.required_peak_deceleration =
+      profile_.start_speed > kEps ?
+      kPi * profile_.start_speed * profile_.start_speed /
+      (4.0 * profile_.decel_distance) : 0.0;
+    diagnostics_.nominal_decel_exceeded =
+      diagnostics_.required_peak_deceleration >
+      speed_options_.nominal_decel + 1e-9;
+    profile_.valid = true;
+    return true;
+  }
+
+  const double accel_to_cruise = minimumSinusoidalDistance(
+    profile_.start_speed, speed_options_.cruise_speed,
+    speed_options_.nominal_accel);
+  const double decel_from_cruise = minimumSinusoidalDistance(
+    speed_options_.cruise_speed, 0.0, speed_options_.nominal_decel);
+
+  if (accel_to_cruise + decel_from_cruise <= profile_.length + kEps) {
+    profile_.peak_speed = speed_options_.cruise_speed;
+    profile_.accel_distance = std::max(
+      speed_options_.accel_fraction * profile_.length, accel_to_cruise);
+    profile_.decel_distance = std::max(
+      speed_options_.decel_fraction * profile_.length, decel_from_cruise);
+
+    if (profile_.accel_distance + profile_.decel_distance > profile_.length) {
+      const double excess =
+        profile_.accel_distance + profile_.decel_distance - profile_.length;
+      const double accel_slack = profile_.accel_distance - accel_to_cruise;
+      const double decel_slack = profile_.decel_distance - decel_from_cruise;
+      const double slack = accel_slack + decel_slack;
+      if (slack > kEps) {
+        profile_.accel_distance -= excess * accel_slack / slack;
+        profile_.decel_distance -= excess * decel_slack / slack;
+      }
+    }
+    profile_.cruise_distance = std::max(
+      0.0, profile_.length - profile_.accel_distance - profile_.decel_distance);
+  } else {
+    // No cruise segment.  The peak is the unique speed whose nominal sine
+    // acceleration and deceleration distances exactly fill the path.
+    const double accel_coefficient = kPi / (4.0 * speed_options_.nominal_accel);
+    const double decel_coefficient = kPi / (4.0 * speed_options_.nominal_decel);
+    const double peak_squared = std::max(
+      profile_.start_speed * profile_.start_speed,
+      (profile_.length +
+      accel_coefficient * profile_.start_speed * profile_.start_speed) /
+      (accel_coefficient + decel_coefficient));
+    profile_.peak_speed = std::sqrt(peak_squared);
+    profile_.accel_distance = accel_coefficient *
+      (peak_squared - profile_.start_speed * profile_.start_speed);
+    profile_.decel_distance = std::max(
+      0.0, profile_.length - profile_.accel_distance);
+  }
+
+  profile_.accel_duration = rampDuration(
+    profile_.accel_distance, profile_.start_speed, profile_.peak_speed);
+  profile_.cruise_duration = profile_.peak_speed > kEps ?
+    profile_.cruise_distance / profile_.peak_speed : 0.0;
+  profile_.decel_duration = rampDuration(
+    profile_.decel_distance, profile_.peak_speed, 0.0);
+  diagnostics_.required_peak_deceleration =
+    profile_.decel_distance > kEps ?
+    kPi * profile_.peak_speed * profile_.peak_speed /
+    (4.0 * profile_.decel_distance) : 0.0;
+  diagnostics_.nominal_decel_exceeded =
+    diagnostics_.required_peak_deceleration >
+    speed_options_.nominal_decel + 1e-9;
+  profile_.valid = true;
+  return true;
+}
+
+bool TrajectoryGenerator::activatePath(
+  const PathGeometry& geometry, const MotionState2D& current_state,
+  std::string* error)
+{
+  active_ = false;
+  profile_ = {};
+  diagnostics_ = {};
+  if (!speed_options_.isValid(error) || !generator_options_.isValid(error)) {
     diagnostics_.status = TrajectoryStatus::PathRejected;
     return false;
   }
-  if (!geometry.valid() || !finitePoint(current_state.position) || !finite(current_state.velocity.x) ||
-      !finite(current_state.velocity.y))
+  if (!geometry.valid() || !finitePoint(current_state.position) ||
+      !finite(current_state.velocity.x) || !finite(current_state.velocity.y))
   {
-    if (error != nullptr)
-    {
+    if (error != nullptr) {
       *error = "Cannot activate an invalid path or non-finite motion state";
     }
     diagnostics_.status = TrajectoryStatus::PathRejected;
     return false;
   }
+
   const Projection projection = geometry.project(current_state.position);
-  if (projection.distance > options_.max_activation_offset)
-  {
-    if (error != nullptr)
-    {
+  if (projection.distance > generator_options_.max_activation_offset) {
+    if (error != nullptr) {
       *error = "New path is farther than max_activation_offset from the vehicle";
     }
     diagnostics_.status = TrajectoryStatus::PathRejected;
@@ -734,29 +530,22 @@ bool TrajectoryGenerator::activatePath(const PathGeometry& geometry, const Motio
   }
 
   path_ = geometry;
-  active_ = true;
   progress_ = projection.arc_length;
-  profile_.clear();
-  exact_nominal_ = {};
-  reference_profile_.clear();
-  reference_exact_nominal_ = {};
-  reference_time_ = 0.0;
-  diagnostics_ = {};
+  const PathSample start = path_.sample(progress_);
+  const double start_speed = std::max(0.0, dot(current_state.velocity, start.tangent));
+  if (!buildProfile(progress_, start_speed)) {
+    diagnostics_.status = TrajectoryStatus::PathRejected;
+    if (error != nullptr) {
+      *error = "Cannot construct the fixed sinusoidal speed profile";
+    }
+    return false;
+  }
+
+  active_ = true;
   diagnostics_.status = TrajectoryStatus::Ready;
   diagnostics_.progress = progress_;
   diagnostics_.remaining_length = path_.length() - progress_;
-  if (!rebuildProfile(current_state, true))
-  {
-    active_ = false;
-    if (error != nullptr)
-    {
-      *error = "Cannot construct the initial trajectory profile";
-    }
-    diagnostics_.status = TrajectoryStatus::PathRejected;
-    return false;
-  }
-  reference_profile_ = profile_;
-  reference_exact_nominal_ = exact_nominal_;
+  diagnostics_.speed_at_progress = desiredSpeed(progress_);
   return true;
 }
 
@@ -764,566 +553,150 @@ void TrajectoryGenerator::clearPath()
 {
   active_ = false;
   progress_ = 0.0;
-  profile_.clear();
-  exact_nominal_ = {};
-  reference_profile_.clear();
-  reference_exact_nominal_ = {};
-  reference_time_ = 0.0;
+  profile_ = {};
   diagnostics_ = {};
 }
 
-bool TrajectoryGenerator::rebuildProfile(const MotionState2D& current_state, bool apply_nominal_shape)
+double TrajectoryGenerator::profileDuration() const
 {
-  profile_.clear();
-  exact_nominal_ = {};
-  if (!active_ || !path_.valid() || !finitePoint(current_state.position) || !finite(current_state.velocity.x) ||
-      !finite(current_state.velocity.y))
-  {
-    diagnostics_.status = TrajectoryStatus::NoActivePath;
-    return false;
+  if (!profile_.valid) {
+    return 0.0;
   }
-  if (options_.profile_spacing <= kEps || options_.minimum_speed_for_time <= 0.0 ||
-      options_.max_reference_lead <= 0.0)
-  {
-    diagnostics_.status = TrajectoryStatus::NoActivePath;
-    return false;
-  }
-
-  const Projection projection = path_.project(current_state.position, progress_, options_.local_projection_backtrack,
-                                              options_.local_projection_lookahead);
-  progress_ = std::max(progress_, projection.arc_length);
-  const double remaining = std::max(0.0, path_.length() - progress_);
-  const PathSample start = path_.sample(progress_);
-  const double initial_speed = std::max(0.0, dot(current_state.velocity, start.tangent));
-
-  diagnostics_ = {};
-  diagnostics_.progress = progress_;
-  diagnostics_.remaining_length = remaining;
-  diagnostics_.normal_stop_distance =
-      minimumSinusoidalDistance(initial_speed, limits_.terminal_speed, limits_.normal_decel);
-  diagnostics_.emergency_stop_distance =
-      minimumSinusoidalDistance(initial_speed, limits_.terminal_speed, limits_.emergency_decel);
-  diagnostics_.stop_deficit = std::max(0.0, diagnostics_.normal_stop_distance - remaining);
-
-  if (remaining <= kEps)
-  {
-    const bool emergency_possible = initial_speed <= limits_.terminal_speed + kEps;
-    diagnostics_.status = emergency_possible ? TrajectoryStatus::Ready : TrajectoryStatus::EmergencyInfeasible;
-    diagnostics_.terminal_speed_if_unstoppable = emergency_possible ? 0.0 : initial_speed;
-    profile_.push_back({ 0.0, path_.length(), initial_speed, 0.0 });
-    return true;
-  }
-
-  const std::size_t segments =
-      std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(remaining / options_.profile_spacing)));
-  std::vector<double> arc_lengths;
-  arc_lengths.reserve(segments + path_.sampleArcLengths().size() + 2);
-  for (std::size_t i = 0; i <= segments; ++i)
-  {
-    arc_lengths.push_back(progress_ + remaining * static_cast<double>(i) / static_cast<double>(segments));
-  }
-  // Curvature is linearly interpolated between geometry samples.  Include every
-  // knot in the time-scaling grid so its local speed cap cannot be skipped.
-  for (const double knot : path_.sampleArcLengths())
-  {
-    if (knot > progress_ + kEps && knot < path_.length() - kEps)
-    {
-      arc_lengths.push_back(knot);
-    }
-  }
-  std::sort(arc_lengths.begin(), arc_lengths.end());
-  arc_lengths.erase(
-      std::unique(arc_lengths.begin(), arc_lengths.end(), [](double a, double b) { return std::fabs(a - b) < 1e-10; }),
-      arc_lengths.end());
-  const std::size_t node_count = arc_lengths.size();
-  // Keep curvature limits separate from the normal cruise target.  A measured
-  // speed can temporarily exceed cruise_speed and still be safely reduced over
-  // distance; it must not be treated as an immediately infeasible constraint.
-  // Curvature limits below cruise_speed and terminal speed remain hard limits.
-  std::vector<double> curve_caps(node_count, kNoLocalSpeedCap);
-  const NominalSpeedShape nominal = [&]() {
-    NominalSpeedShape shape;
-    shape.build(remaining, initial_speed, limits_);
-    return shape;
-  }();
-
-  if (options_.enforce_curve_speed_limit)
-  {
-    for (std::size_t i = 0; i < node_count; ++i)
-    {
-      const PathSample path_sample = path_.sample(arc_lengths[i]);
-      const double curvature = std::fabs(path_sample.curvature);
-      if (curvature > 1e-8)
-      {
-        curve_caps[i] = std::min(curve_caps[i], std::sqrt(limits_.max_lateral_accel / curvature));
-      }
-    }
-    // Cap both ends of each profile segment by that segment's maximum curvature.
-    // This is deliberately conservative over one small segment, but guarantees
-    // interpolated time samples cannot exceed the lateral-acceleration limit.
-    for (std::size_t i = 0; i + 1 < node_count; ++i)
-    {
-      const double curvature_a = std::fabs(path_.sample(arc_lengths[i]).curvature);
-      const double curvature_b = std::fabs(path_.sample(arc_lengths[i + 1]).curvature);
-      const double max_curvature = std::max(curvature_a, curvature_b);
-      if (max_curvature > 1e-8)
-      {
-        const double segment_cap = std::sqrt(limits_.max_lateral_accel / max_curvature);
-        curve_caps[i] = std::min(curve_caps[i], segment_cap);
-        curve_caps[i + 1] = std::min(curve_caps[i + 1], segment_cap);
-      }
-    }
-  }
-
-  std::vector<double> caps(node_count, limits_.cruise_speed);
-  for (std::size_t i = 0; i < node_count; ++i)
-  {
-    caps[i] = std::min(caps[i], curve_caps[i]);
-    if (apply_nominal_shape && nominal.valid)
-    {
-      caps[i] = std::min(caps[i], nominal.speedAt(arc_lengths[i] - progress_));
-    }
-    caps[i] = std::max(0.0, caps[i]);
-  }
-
-  if (!apply_nominal_shape && initial_speed > limits_.cruise_speed + kSpeedFeasibilityTolerance)
-  {
-    // Relax only the cruise cap while the vehicle can decelerate to it under
-    // normal braking.  Do not relax a tighter curvature cap or the terminal
-    // stop requirement: those remain safety constraints.
-    for (std::size_t i = 0; i + 1 < node_count; ++i)
-    {
-      if (curve_caps[i] + kSpeedFeasibilityTolerance < limits_.cruise_speed)
-      {
-        continue;
-      }
-      const double distance_from_start = arc_lengths[i] - progress_;
-      const double normal_braking_speed = std::sqrt(std::max(
-        0.0, initial_speed * initial_speed - 2.0 * limits_.normal_decel * distance_from_start));
-      caps[i] = std::max(caps[i], normal_braking_speed);
-    }
-  }
-  caps.back() = std::min(caps.back(), limits_.terminal_speed);
-
-  const std::vector<double> normal_back =
-      backwardEnvelope(caps, arc_lengths, limits_.terminal_speed, limits_.normal_decel);
-  const bool normal_infeasible =
-      diagnostics_.normal_stop_distance > remaining + 1e-6 ||
-      initial_speed > normal_back.front() + kSpeedFeasibilityTolerance;
-  const double decel_used = normal_infeasible ? limits_.emergency_decel : limits_.normal_decel;
-  const std::vector<double> back =
-      normal_infeasible ? backwardEnvelope(caps, arc_lengths, limits_.terminal_speed, limits_.emergency_decel) :
-                          normal_back;
-
-  const bool emergency_infeasible = normal_infeasible &&
-      (diagnostics_.emergency_stop_distance > remaining + 1e-6 ||
-       initial_speed > back.front() + kSpeedFeasibilityTolerance);
-  diagnostics_.status = emergency_infeasible ?
-                            TrajectoryStatus::EmergencyInfeasible :
-                            (normal_infeasible ? TrajectoryStatus::EmergencyBraking : TrajectoryStatus::Ready);
-  if (normal_infeasible)
-  {
-    const double speed_gap_sq =
-        std::max(0.0, initial_speed * initial_speed - normal_back.front() * normal_back.front());
-    diagnostics_.stop_deficit = std::max(diagnostics_.stop_deficit, speed_gap_sq / (2.0 * limits_.normal_decel));
-  }
-
-  std::vector<double> speeds(node_count, 0.0);
-  speeds.front() = initial_speed;
-  for (std::size_t i = 1; i < node_count; ++i)
-  {
-    const double ds = arc_lengths[i] - arc_lengths[i - 1];
-    const double acceleration_reachable =
-        std::sqrt(std::max(0.0, speeds[i - 1] * speeds[i - 1] + 2.0 * limits_.max_accel * ds));
-    const double braking_floor = std::sqrt(std::max(0.0, speeds[i - 1] * speeds[i - 1] - 2.0 * decel_used * ds));
-    speeds[i] = std::min(back[i], acceleration_reachable);
-    if (speeds[i] + kSpeedFeasibilityTolerance < braking_floor)
-    {
-      // Even emergency braking cannot reach the requested curve/end speed.
-      // Keep the physically reachable speed and make the unsafe condition explicit.
-      speeds[i] = braking_floor;
-      diagnostics_.status = TrajectoryStatus::EmergencyInfeasible;
-    }
-  }
-  diagnostics_.terminal_speed_if_unstoppable =
-      diagnostics_.status == TrajectoryStatus::EmergencyInfeasible ? speeds.back() : 0.0;
-
-  // If no curve or acceleration envelope changed the nominal profile, retain
-  // its analytic time-domain sine form instead of approximating it as piecewise
-  // constant acceleration.  Constrained portions use the table below.
-  if (apply_nominal_shape && diagnostics_.status == TrajectoryStatus::Ready && nominal.valid)
-  {
-    bool equals_nominal = true;
-    for (std::size_t i = 0; i < node_count; ++i)
-    {
-      if (std::fabs(speeds[i] - nominal.speedAt(arc_lengths[i] - progress_)) > 1e-6)
-      {
-        equals_nominal = false;
-        break;
-      }
-    }
-    if (equals_nominal)
-    {
-      exact_nominal_.active = true;
-      exact_nominal_.direct_ramp = nominal.direct_ramp;
-      exact_nominal_.start_arc_length = progress_;
-      exact_nominal_.length = nominal.length;
-      exact_nominal_.start_speed = nominal.start_speed;
-      exact_nominal_.peak_speed = nominal.peak_speed;
-      exact_nominal_.end_speed = nominal.end_speed;
-      exact_nominal_.accel_distance = nominal.accel_distance;
-      exact_nominal_.cruise_distance = nominal.cruise_distance;
-      exact_nominal_.decel_distance = nominal.decel_distance;
-    }
-  }
-
-  profile_.resize(node_count);
-  profile_[0] = { 0.0, arc_lengths[0], speeds[0], 0.0 };
-  for (std::size_t i = 1; i < node_count; ++i)
-  {
-    const double ds = arc_lengths[i] - arc_lengths[i - 1];
-    const double speed_sum = speeds[i - 1] + speeds[i];
-    // A valid forward path cannot have a finite-length segment with both
-    // endpoint speeds zero.  The minimum avoids a division-by-zero while
-    // retaining a deterministic diagnostic trajectory for that bad input.
-    const double dt = 2.0 * ds / std::max(options_.minimum_speed_for_time, speed_sum);
-    const double tangential_acceleration = (speeds[i] - speeds[i - 1]) / dt;
-    profile_[i - 1].tangential_acceleration = tangential_acceleration;
-    profile_[i] = { profile_[i - 1].time + dt, arc_lengths[i], speeds[i], tangential_acceleration };
-  }
-  profile_.back().tangential_acceleration = 0.0;
-  return true;
+  return profile_.direct_deceleration ? profile_.decel_duration :
+    profile_.accel_duration + profile_.cruise_duration + profile_.decel_duration;
 }
 
-ReferencePoint TrajectoryGenerator::sampleProfile(const std::vector<ProfileNode>& profile,
-                                                  const ExactSinusoid& exact_nominal,
-                                                  double profile_time) const
+double TrajectoryGenerator::profileTimeAtArcLength(double arc_length) const
+{
+  if (!profile_.valid || profile_.length <= kEps) {
+    return 0.0;
+  }
+  const double relative_s = clamp(
+    arc_length - profile_.start_arc_length, 0.0, profile_.length);
+
+  if (profile_.direct_deceleration) {
+    return inverseRampTime(
+      profile_.decel_duration, profile_.start_speed, 0.0, relative_s);
+  }
+  if (relative_s <= profile_.accel_distance) {
+    return inverseRampTime(
+      profile_.accel_duration, profile_.start_speed,
+      profile_.peak_speed, relative_s);
+  }
+  if (relative_s <= profile_.accel_distance + profile_.cruise_distance) {
+    return profile_.accel_duration +
+      (relative_s - profile_.accel_distance) / profile_.peak_speed;
+  }
+  return profile_.accel_duration + profile_.cruise_duration +
+    inverseRampTime(
+      profile_.decel_duration, profile_.peak_speed, 0.0,
+      relative_s - profile_.accel_distance - profile_.cruise_distance);
+}
+
+ReferencePoint TrajectoryGenerator::sampleProfileTime(double profile_time) const
 {
   ReferencePoint result;
-  if (profile.empty())
-  {
+  if (!active_ || !profile_.valid) {
     return result;
   }
 
-  double s = profile.front().arc_length;
-  double speed = profile.front().speed;
-  double tangential_acceleration = profile.front().tangential_acceleration;
-  if (exact_nominal.active)
-  {
-    const auto phase = [](double duration, double from, double to, double time, double* distance, double* value,
-                          double* acceleration) {
-      if (duration <= kEps)
-      {
-        *distance = 0.0;
-        *value = to;
-        *acceleration = 0.0;
-        return;
-      }
-      const double delta = to - from;
-      const double mean = 0.5 * (from + to);
-      const double clamped_time = clamp(time, 0.0, duration);
-      const double angle = kPi * clamped_time / duration;
-      *distance = mean * clamped_time - (delta * duration / (2.0 * kPi)) * std::sin(angle);
-      *value = from + 0.5 * delta * (1.0 - std::cos(angle));
-      *acceleration = 0.5 * delta * kPi / duration * std::sin(angle);
-    };
+  const double time = clamp(profile_time, 0.0, profileDuration());
+  double relative_s = 0.0;
+  double speed = 0.0;
+  double tangential_acceleration = 0.0;
 
-    const double accel_duration =
-        exact_nominal.accel_distance > kEps && exact_nominal.start_speed + exact_nominal.peak_speed > kEps ?
-            2.0 * exact_nominal.accel_distance / (exact_nominal.start_speed + exact_nominal.peak_speed) :
-            0.0;
-    const double cruise_duration =
-        exact_nominal.peak_speed > kEps ? exact_nominal.cruise_distance / exact_nominal.peak_speed : 0.0;
-    const double decel_duration =
-        exact_nominal.decel_distance > kEps && exact_nominal.peak_speed + exact_nominal.end_speed > kEps ?
-            2.0 * exact_nominal.decel_distance / (exact_nominal.peak_speed + exact_nominal.end_speed) :
-            0.0;
-    const double total_duration =
-        exact_nominal.direct_ramp ?
-            2.0 * exact_nominal.length / std::max(kEps, exact_nominal.start_speed + exact_nominal.end_speed) :
-            accel_duration + cruise_duration + decel_duration;
-
-    double relative_s = 0.0;
-    if (profile_time >= total_duration)
-    {
-      relative_s = exact_nominal.length;
-      speed = exact_nominal.end_speed;
-      tangential_acceleration = 0.0;
-    }
-    else if (exact_nominal.direct_ramp)
-    {
-      phase(total_duration, exact_nominal.start_speed, exact_nominal.end_speed, profile_time, &relative_s, &speed,
-            &tangential_acceleration);
-    }
-    else if (profile_time <= accel_duration)
-    {
-      phase(accel_duration, exact_nominal.start_speed, exact_nominal.peak_speed, profile_time, &relative_s, &speed,
-            &tangential_acceleration);
-    }
-    else if (profile_time <= accel_duration + cruise_duration)
-    {
-      relative_s = exact_nominal.accel_distance + exact_nominal.peak_speed * (profile_time - accel_duration);
-      speed = exact_nominal.peak_speed;
-      tangential_acceleration = 0.0;
-    }
-    else
-    {
-      double decel_s = 0.0;
-      phase(decel_duration, exact_nominal.peak_speed, exact_nominal.end_speed,
-            profile_time - accel_duration - cruise_duration, &decel_s, &speed, &tangential_acceleration);
-      relative_s = exact_nominal.accel_distance + exact_nominal.cruise_distance + decel_s;
-    }
-    s = exact_nominal.start_arc_length + relative_s;
-  }
-  else if (profile_time >= profile.back().time)
-  {
-    s = profile.back().arc_length;
-    speed = profile.back().speed;
-    tangential_acceleration = 0.0;
-  }
-  else if (profile_time > 0.0)
-  {
-    const auto upper = std::upper_bound(profile.begin(), profile.end(), profile_time,
-                                        [](double time, const ProfileNode& node) { return time < node.time; });
-    const std::size_t next = static_cast<std::size_t>(upper - profile.begin());
-    const std::size_t previous = next - 1;
-    const ProfileNode& a = profile[previous];
-    const ProfileNode& b = profile[next];
-    const double duration = b.time - a.time;
-    const double local_time = profile_time - a.time;
-    tangential_acceleration = duration > kEps ? (b.speed - a.speed) / duration : 0.0;
-    speed = a.speed + tangential_acceleration * local_time;
-    s = a.arc_length + a.speed * local_time + 0.5 * tangential_acceleration * local_time * local_time;
-    s = clamp(s, a.arc_length, b.arc_length);
+  if (profile_.length <= kEps || time >= profileDuration() - kEps) {
+    relative_s = profile_.length;
+  } else if (profile_.direct_deceleration) {
+    const RampValue value = sampleRamp(
+      profile_.decel_duration, profile_.start_speed, 0.0, time);
+    relative_s = value.distance;
+    speed = value.speed;
+    tangential_acceleration = value.acceleration;
+  } else if (time <= profile_.accel_duration) {
+    const RampValue value = sampleRamp(
+      profile_.accel_duration, profile_.start_speed,
+      profile_.peak_speed, time);
+    relative_s = value.distance;
+    speed = value.speed;
+    tangential_acceleration = value.acceleration;
+  } else if (time <= profile_.accel_duration + profile_.cruise_duration) {
+    relative_s = profile_.accel_distance +
+      profile_.peak_speed * (time - profile_.accel_duration);
+    speed = profile_.peak_speed;
+  } else {
+    const RampValue value = sampleRamp(
+      profile_.decel_duration, profile_.peak_speed, 0.0,
+      time - profile_.accel_duration - profile_.cruise_duration);
+    relative_s = profile_.accel_distance + profile_.cruise_distance + value.distance;
+    speed = value.speed;
+    tangential_acceleration = value.acceleration;
   }
 
-  const PathSample path_sample = path_.sample(s);
-  const Vector2 normal{ -path_sample.tangent.y, path_sample.tangent.x };
-  result.time_from_now = std::max(0.0, profile_time);
-  result.arc_length = s;
+  const double arc_length = clamp(
+    profile_.start_arc_length + relative_s,
+    profile_.start_arc_length, path_.length());
+  const PathSample path_sample = path_.sample(arc_length);
+  const Vector2 normal{-path_sample.tangent.y, path_sample.tangent.x};
+  result.arc_length = arc_length;
   result.position = path_sample.position;
-  result.speed = speed;
+  result.speed = std::max(0.0, speed);
   result.tangential_acceleration = tangential_acceleration;
   result.curvature = path_sample.curvature;
-  result.velocity = scale(path_sample.tangent, speed);
-  result.acceleration =
-      add(scale(path_sample.tangent, tangential_acceleration), scale(normal, path_sample.curvature * speed * speed));
+  result.velocity = scale(path_sample.tangent, result.speed);
+  result.acceleration = add(
+    scale(path_sample.tangent, tangential_acceleration),
+    scale(normal, path_sample.curvature * result.speed * result.speed));
   return result;
 }
 
-double TrajectoryGenerator::profileSpeedAtArcLength(const std::vector<ProfileNode>& profile,
-                                                    double arc_length) const
+double TrajectoryGenerator::desiredSpeed(double arc_length) const
 {
-  if (profile.empty())
-  {
+  if (!active_ || !profile_.valid) {
     return 0.0;
   }
-  if (arc_length <= profile.front().arc_length)
-  {
-    return profile.front().speed;
-  }
-  if (arc_length >= profile.back().arc_length)
-  {
-    return profile.back().speed;
-  }
-
-  const auto upper = std::upper_bound(profile.begin(), profile.end(), arc_length,
-                                      [](double s, const ProfileNode& node) { return s < node.arc_length; });
-  const ProfileNode& b = *upper;
-  const ProfileNode& a = *(upper - 1);
-  const double ds = b.arc_length - a.arc_length;
-  const double ratio = ds > kEps ? clamp((arc_length - a.arc_length) / ds, 0.0, 1.0) : 0.0;
-  // Constant tangential acceleration is linear in v^2 over distance. Using
-  // energy interpolation avoids an artificial near-zero cap in the first
-  // spatial cell when the vehicle starts from rest.
-  const double speed_squared = a.speed * a.speed + ratio * (b.speed * b.speed - a.speed * a.speed);
-  return std::sqrt(std::max(0.0, speed_squared));
+  return sampleProfileTime(profileTimeAtArcLength(arc_length)).speed;
 }
 
-double TrajectoryGenerator::profileDuration(const std::vector<ProfileNode>& profile,
-                                            const ExactSinusoid& exact_nominal) const
+TrajectoryStatus TrajectoryGenerator::makeHorizon(
+  const MotionState2D& current_state, double dt, std::size_t steps,
+  std::vector<ReferencePoint>* out,
+  const HeadingProvider& heading_provider)
 {
-  if (profile.empty())
-  {
-    return 0.0;
+  if (out == nullptr) {
+    return TrajectoryStatus::NoActivePath;
   }
-  if (!exact_nominal.active)
+  out->clear();
+  if (!active_ || !path_.valid() || !profile_.valid ||
+      !finite(dt) || dt <= 0.0 || steps == 0 ||
+      !finitePoint(current_state.position) ||
+      !finite(current_state.velocity.x) || !finite(current_state.velocity.y))
   {
-    return profile.back().time;
-  }
-  if (exact_nominal.direct_ramp)
-  {
-    return 2.0 * exact_nominal.length /
-           std::max(kEps, exact_nominal.start_speed + exact_nominal.end_speed);
+    return TrajectoryStatus::NoActivePath;
   }
 
-  const double accel_duration =
-      exact_nominal.accel_distance > kEps && exact_nominal.start_speed + exact_nominal.peak_speed > kEps ?
-          2.0 * exact_nominal.accel_distance / (exact_nominal.start_speed + exact_nominal.peak_speed) :
-          0.0;
-  const double cruise_duration =
-      exact_nominal.peak_speed > kEps ? exact_nominal.cruise_distance / exact_nominal.peak_speed : 0.0;
-  const double decel_duration =
-      exact_nominal.decel_distance > kEps && exact_nominal.peak_speed + exact_nominal.end_speed > kEps ?
-          2.0 * exact_nominal.decel_distance / (exact_nominal.peak_speed + exact_nominal.end_speed) :
-          0.0;
-  return accel_duration + cruise_duration + decel_duration;
-}
+  const Projection projection = path_.project(
+    current_state.position, progress_,
+    generator_options_.local_projection_backtrack,
+    generator_options_.local_projection_lookahead);
+  progress_ = std::max(progress_, projection.arc_length);
+  diagnostics_.status = TrajectoryStatus::Ready;
+  diagnostics_.progress = progress_;
+  diagnostics_.remaining_length = std::max(0.0, path_.length() - progress_);
+  diagnostics_.speed_at_progress = desiredSpeed(progress_);
 
-double TrajectoryGenerator::profileTimeAtArcLength(const std::vector<ProfileNode>& profile,
-                                                   const ExactSinusoid& exact_nominal,
-                                                   double arc_length) const
-{
-  if (profile.empty() || arc_length <= profile.front().arc_length)
-  {
-    return 0.0;
-  }
-  const double duration = profileDuration(profile, exact_nominal);
-  if (arc_length >= profile.back().arc_length || duration <= kEps)
-  {
-    return duration;
-  }
-
-  double lo = 0.0;
-  double hi = duration;
-  for (int iteration = 0; iteration < 60; ++iteration)
-  {
-    const double mid = 0.5 * (lo + hi);
-    if (sampleProfile(profile, exact_nominal, mid).arc_length < arc_length)
-    {
-      lo = mid;
-    }
-    else
-    {
-      hi = mid;
-    }
-  }
-  return 0.5 * (lo + hi);
-}
-
-TrajectoryStatus TrajectoryGenerator::makeHorizon(const MotionState2D& current_state, double dt, std::size_t steps,
-                                                  std::vector<ReferencePoint>* out,
-                                                  const HeadingProvider& heading_provider)
-{
-  if (out != nullptr)
-  {
-    out->clear();
-  }
-  if (!active_ || out == nullptr || !finite(dt) || dt <= 0.0 || steps == 0)
-  {
-    return active_ ? diagnostics_.status : TrajectoryStatus::NoActivePath;
-  }
-  // Rebuild only the safety envelope from the latest measured state. The
-  // activation-time nominal profile below is deliberately kept intact so its
-  // sine phase cannot restart at every control tick.
-  if (!rebuildProfile(current_state, false))
-  {
-    return diagnostics_.status;
-  }
-  // Characterisation mode deliberately keeps the activation-time v_des(s)
-  // independent of the newest velocity feedback. Keep stop-distance values
-  // in diagnostics, but never escalate them to an autonomous zero command.
-  if (!options_.enforce_dynamic_safety_envelope)
-  {
-    diagnostics_.status = TrajectoryStatus::Ready;
-    diagnostics_.terminal_speed_if_unstoppable = 0.0;
-  }
-  if (reference_profile_.empty())
-  {
-    diagnostics_.status = TrajectoryStatus::NoActivePath;
-    return diagnostics_.status;
-  }
-
-  const double reference_duration = profileDuration(reference_profile_, reference_exact_nominal_);
-  const double reference_end = reference_profile_.back().arc_length;
-  const double synchronized_time = profileTimeAtArcLength(
-      reference_profile_, reference_exact_nominal_, std::min(progress_, reference_end));
-  const double allowed_reference_arc =
-      std::min(reference_end, progress_ + options_.max_reference_lead);
-  const double allowed_reference_time = profileTimeAtArcLength(
-      reference_profile_, reference_exact_nominal_, allowed_reference_arc);
-  const double proposed_reference_time = std::max(reference_time_ + dt, synchronized_time);
-  reference_time_ = std::min(reference_duration,
-                             std::max(reference_time_, std::min(proposed_reference_time, allowed_reference_time)));
-  // This is the persistent, activation-time nominal speed v_des(s) at the
-  // vehicle's current projected path position. It remains observable even if
-  // a later safety envelope has to alter the final reference.
-  const ReferencePoint nominal_at_progress = sampleProfile(
-      reference_profile_, reference_exact_nominal_, synchronized_time);
-
+  const double current_profile_time = profileTimeAtArcLength(progress_);
   out->reserve(steps);
-  const PathSample measured_path_sample = path_.sample(progress_);
-  double previous_speed = std::max(0.0, dot(current_state.velocity, measured_path_sample.tangent));
-  double reference_arc = progress_;
-  const double deceleration = diagnostics_.status == TrajectoryStatus::Ready ?
-                                  limits_.normal_decel : limits_.emergency_decel;
-  for (std::size_t i = 0; i < steps; ++i)
-  {
-    const double time_from_now = static_cast<double>(i + 1) * dt;
-    const double profile_time = std::min(reference_duration, reference_time_ + static_cast<double>(i) * dt);
-    const ReferencePoint nominal = sampleProfile(
-        reference_profile_, reference_exact_nominal_, profile_time);
-
-    double speed = nominal.speed;
-    bool reachability_limited = false;
-    double next_arc = nominal.arc_length;
-    bool spatial_safety_limited = false;
-    if (options_.enforce_dynamic_safety_envelope)
-    {
-      const double lower_speed = std::max(0.0, previous_speed - deceleration * dt);
-      const double upper_speed = previous_speed + limits_.max_accel * dt;
-      speed = clamp(nominal.speed, lower_speed, upper_speed);
-      reachability_limited = std::fabs(speed - nominal.speed) > 1e-8;
-
-      // Couple the persistent nominal phase to the spatial safety envelope. Two
-      // passes are sufficient because the candidate distance changes only one
-      // control step and profile_spacing is small.
-      next_arc = reference_arc;
-      for (int pass = 0; pass < 2; ++pass)
-      {
-        next_arc = std::min(path_.length(), reference_arc + 0.5 * (previous_speed + speed) * dt);
-        // Leave a small numerical margin so projection/tangent interpolation on
-        // the next control tick cannot place the measured speed microscopically
-        // above the backward braking envelope and falsely report infeasibility.
-        const double spatial_cap =
-            std::max(0.0, profileSpeedAtArcLength(profile_, next_arc) - 1e-4);
-        spatial_safety_limited = spatial_safety_limited || speed > spatial_cap + 1e-8;
-        speed = std::max(lower_speed, std::min(speed, spatial_cap));
-      }
-      next_arc = std::min(path_.length(), reference_arc + 0.5 * (previous_speed + speed) * dt);
-    }
-
-    const PathSample path_sample = path_.sample(next_arc);
-    const Vector2 normal{ -path_sample.tangent.y, path_sample.tangent.x };
-    const double tangential_acceleration = options_.enforce_dynamic_safety_envelope ?
-                                          (speed - previous_speed) / dt :
-                                          nominal.tangential_acceleration;
-    ReferencePoint point;
+  for (std::size_t i = 0; i < steps; ++i) {
+    const double time_from_now = dt * static_cast<double>(i + 1);
+    ReferencePoint point = sampleProfileTime(current_profile_time + time_from_now);
     point.time_from_now = time_from_now;
-    point.arc_length = next_arc;
-    point.position = path_sample.position;
-    point.speed = speed;
-    point.tangential_acceleration = tangential_acceleration;
-    point.curvature = path_sample.curvature;
-    point.velocity = scale(path_sample.tangent, speed);
-    point.acceleration = add(
-        scale(path_sample.tangent, tangential_acceleration),
-        scale(normal, path_sample.curvature * speed * speed));
-    point.nominal_phase_arc_length = nominal.arc_length;
-    point.nominal_phase_speed = nominal.speed;
-    point.nominal_speed_at_progress = nominal_at_progress.speed;
-    point.nominal_phase_velocity = nominal.velocity;
-    point.reachability_limited = reachability_limited;
-    point.spatial_safety_limited = spatial_safety_limited;
-    if (heading_provider)
-    {
+    if (heading_provider) {
       point.heading = heading_provider(time_from_now, point.arc_length);
     }
     out->push_back(point);
-    reference_arc = next_arc;
-    previous_speed = speed;
   }
-  return diagnostics_.status;
+  return TrajectoryStatus::Ready;
 }
 
 }  // namespace trajectory

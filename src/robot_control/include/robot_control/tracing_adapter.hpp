@@ -9,24 +9,15 @@ namespace robot_control
 namespace tracing
 {
 
-// Rotate a planar vector counter-clockwise by angle.  This is used to express
-// an odometry twist in the physical chassis frame when its reported child
-// frame has a fixed yaw alignment offset.
-inline trajectory::Vector2 rotatePlanarVelocity(
-  double angle, double velocity_x, double velocity_y)
-{
-  const double c = std::cos(angle);
-  const double s = std::sin(angle);
-  return {c * velocity_x - s * velocity_y,
-    s * velocity_x + c * velocity_y};
-}
-
 // Convert an Odometry twist expressed in the chassis frame to the shared world
 // frame used by translational_trajectory.
 inline trajectory::Vector2 bodyVelocityToWorld(
   double yaw, double velocity_x_body, double velocity_y_body)
 {
-  return rotatePlanarVelocity(yaw, velocity_x_body, velocity_y_body);
+  const double c = std::cos(yaw);
+  const double s = std::sin(yaw);
+  return {c * velocity_x_body - s * velocity_y_body,
+    s * velocity_x_body + c * velocity_y_body};
 }
 
 // Convert a world-frame planar velocity command to the current chassis frame
@@ -48,12 +39,19 @@ inline double yawFromQuaternion(double x, double y, double z, double w)
     1.0 - 2.0 * (y * y + z * z));
 }
 
-// Keep corrected yaw in the principal interval after applying a fixed sensor
-// or frame-alignment offset.
-inline double normalizeYaw(double yaw)
+inline double planarDistance(
+  const trajectory::Point2 & first, const trajectory::Point2 & second)
 {
-  constexpr double kTwoPi = 6.28318530717958647692;
-  return std::remainder(yaw, kTwoPi);
+  return std::hypot(first.x - second.x, first.y - second.y);
+}
+
+inline bool goalReached(
+  double remaining_distance, double endpoint_distance, double measured_speed,
+  double position_tolerance, double speed_tolerance)
+{
+  return remaining_distance <= position_tolerance &&
+         endpoint_distance <= position_tolerance &&
+         measured_speed <= speed_tolerance;
 }
 
 }  // namespace tracing
